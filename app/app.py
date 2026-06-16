@@ -119,6 +119,8 @@ EVAL_TESTS = [
     ("this_update",   "thisUpdate sanity (present, not future-dated)"),
     ("next_update",   "nextUpdate freshness (present, not in the past)"),
     ("crl_number",    "CRL Number present and not regressed (no rollback)"),
+    ("weak_signature", "Signature algorithm strength (no MD5/SHA-1)"),
+    ("idp",           "Issuing Distribution Point scope consistency"),
     ("response_time", "Response-time threshold (download under the limit)"),
 ]
 # Foundational tests are prerequisites in a chain (each enables the next); when
@@ -540,6 +542,71 @@ def _parse_crl_number(value):
         return None
 
 
+# Hash algorithms considered too weak for a CRL signature. SHA-1 and the MD
+# family are deprecated for signing; SHA-256 and above (and EdDSA, which carries
+# its own hash) are acceptable.
+WEAK_SIGNATURE_HASHES = frozenset({"md5", "md2", "md4", "sha1"})
+
+
+def _signature_hash_name(crl):
+    """Lowercase name of the CRL's signature hash, or None for EdDSA (which
+    carries its own hash and exposes no separate hash algorithm)."""
+    try:
+        alg = crl.signature_hash_algorithm
+    except Exception:
+        return None
+    return alg.name.lower() if alg is not None else None
+
+
+def _cert_is_ca(cert):
+    """True when the certificate asserts cA=TRUE in BasicConstraints."""
+    try:
+        return bool(cert.extensions.get_extension_for_class(
+            x509.BasicConstraints).value.ca)
+    except x509.ExtensionNotFound:
+        return False
+    except Exception:
+        return False
+
+
+def _check_idp(crl, cert, crl_url):
+    """Validate the CRL's Issuing Distribution Point against the certificate and
+    the URL we fetched. Returns (ok, message). An absent IDP is acceptable
+    (the extension is optional)."""
+    try:
+        idp = crl.extensions.get_extension_for_class(
+            x509.IssuingDistributionPoint).value
+    except x509.ExtensionNotFound:
+        return True, "No Issuing Distribution Point extension (optional)."
+    except Exception as e:
+        return False, f"Issuing Distribution Point could not be read ({e})."
+
+    problems = []
+    is_ca = _cert_is_ca(cert)
+    if idp.only_contains_attribute_certs:
+        problems.append("CRL is scoped to attribute certificates only.")
+    if idp.only_contains_user_certs and is_ca:
+        problems.append("CRL is scoped to end-entity certs but the checked cert is a CA.")
+    if idp.only_contains_ca_certs and not is_ca:
+        problems.append("CRL is scoped to CA certs but the checked cert is an end-entity cert.")
+    # The distribution point we fetched should be named by the IDP, when it
+    # lists URI distribution points.
+    uris = [n.value for n in (idp.full_name or [])
+            if isinstance(n, x509.UniformResourceIdentifier)]
+    if crl_url and uris and crl_url not in uris:
+        problems.append("the fetched CRL URL is not listed in the IDP distribution point.")
+
+    if problems:
+        return False, "IDP scope mismatch: " + " ".join(problems)
+    notes = []
+    if idp.only_some_reasons:
+        notes.append("partial CRL (only some reasons)")
+    if idp.indirect_crl:
+        notes.append("indirect CRL")
+    suffix = f" ({'; '.join(notes)})" if notes else ""
+    return True, f"Issuing Distribution Point scope is consistent{suffix}."
+
+
 # Allow a little clock skew before calling a thisUpdate "future-dated".
 _CLOCK_SKEW = timedelta(minutes=5)
 
@@ -591,7 +658,7 @@ def _crl_update_window(crl):
 
 def _evaluate_tests(enabled, crl, this_update, next_update, issuer, cert,
                     elapsed_ms=None, threshold_ms=0,
-                    crl_number=None, prev_crl_number=None):
+                    crl_number=None, prev_crl_number=None, crl_url=None):
     """Run the enabled selectable tests against a successfully parsed CRL.
 
     Returns (checks, revoked) where `revoked` is True when the certificate's
@@ -666,6 +733,23 @@ def _evaluate_tests(enabled, crl, this_update, next_update, issuer, cert,
         else:
             suffix = "" if prev_crl_number is None else f" (>= previous {prev_crl_number})"
             add("crl_number", True, f"CRL Number is {crl_number}{suffix}.")
+
+    if "weak_signature" in enabled:
+        hname = _signature_hash_name(crl)
+        if hname is None:
+            add("weak_signature", True,
+                "CRL uses a modern signature (EdDSA / no legacy hash).")
+        elif hname in WEAK_SIGNATURE_HASHES:
+            add("weak_signature", False,
+                f"CRL is signed with a weak hash ({hname}); SHA-256 or stronger "
+                f"is recommended.")
+        else:
+            add("weak_signature", True,
+                f"CRL signature hash ({hname}) is acceptable.")
+
+    if "idp" in enabled:
+        ok, msg = _check_idp(crl, cert, crl_url)
+        add("idp", ok, msg)
 
     if "response_time" in enabled:
         limit = int(threshold_ms or 0)
@@ -860,7 +944,7 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
     eval_checks, revoked = _evaluate_tests(
         enabled, crl, this_update, next_update, issuer, cert,
         elapsed_ms=elapsed_ms, threshold_ms=threshold_ms,
-        crl_number=crl_number, prev_crl_number=prev_crl_number,
+        crl_number=crl_number, prev_crl_number=prev_crl_number, crl_url=url,
     )
     checks.extend(eval_checks)
 

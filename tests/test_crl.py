@@ -69,7 +69,7 @@ def _make_leaf(ca_key, ca_cert, cn="leaf", serial=None):
 
 
 def _make_crl(ca_key, ca_cert, revoked_serials=(),
-              last_days=-1, next_days=7, crl_number=None):
+              last_days=-1, next_days=7, crl_number=None, idp=None, sig_hash=None):
     now = datetime.now(timezone.utc)
     builder = (
         x509.CertificateRevocationListBuilder()
@@ -79,6 +79,8 @@ def _make_crl(ca_key, ca_cert, revoked_serials=(),
     )
     if crl_number is not None:
         builder = builder.add_extension(x509.CRLNumber(crl_number), critical=False)
+    if idp is not None:
+        builder = builder.add_extension(idp, critical=False)
     for s in revoked_serials:
         rc = (
             x509.RevokedCertificateBuilder()
@@ -87,7 +89,7 @@ def _make_crl(ca_key, ca_cert, revoked_serials=(),
             .build()
         )
         builder = builder.add_revoked_certificate(rc)
-    return builder.sign(ca_key, hashes.SHA256())
+    return builder.sign(ca_key, sig_hash or hashes.SHA256())
 
 
 def _pem(cert):
@@ -315,6 +317,95 @@ def test_check_monitor_persists_crl_number_and_detects_rollback(m, monkeypatch):
         assert res2.status == "Error", res2.message
         cn = next(c for c in res2.checks if c["key"] == "crl_number")
         assert cn["status"] == "fail"
+
+
+class _FakeCRL:
+    """Minimal stand-in for evaluating the weak-signature rule; cryptography 44
+    refuses to *sign* a CRL with SHA-1, so we can't build one to download."""
+    def __init__(self, hash_alg):
+        self.signature_hash_algorithm = hash_alg
+
+    def get_revoked_certificate_by_serial_number(self, serial):
+        return None
+
+
+def test_weak_signature_sha1_fails(m):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    fake = _FakeCRL(hashes.SHA1())
+    checks, _ = m._evaluate_tests(["weak_signature"], fake, None, None, ca, leaf)
+    ws = next(c for c in checks if c["key"] == "weak_signature")
+    assert ws["status"] == "fail"
+    assert m._signature_hash_name(fake) == "sha1"
+    assert "sha1" in m.WEAK_SIGNATURE_HASHES
+
+
+def test_weak_signature_sha256_passes(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    crl = _make_crl(ca_key, ca)  # signed with SHA-256 by default
+    _stub_download(m, monkeypatch, crl)
+
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+                          DEFAULTS + ["weak_signature"])
+    assert res.status == "Valid", res.message
+    ws = next(c for c in res.checks if c["key"] == "weak_signature")
+    assert ws["status"] == "pass"
+
+
+def _idp(**kw):
+    base = dict(full_name=None, relative_name=None, only_contains_user_certs=False,
+                only_contains_ca_certs=False, only_some_reasons=None,
+                indirect_crl=False, only_contains_attribute_certs=False)
+    base.update(kw)
+    return x509.IssuingDistributionPoint(**base)
+
+
+def test_idp_absent_passes(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    crl = _make_crl(ca_key, ca)  # no IDP extension
+    _stub_download(m, monkeypatch, crl)
+
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+                          DEFAULTS + ["idp"])
+    assert res.status == "Valid", res.message
+    idp = next(c for c in res.checks if c["key"] == "idp")
+    assert idp["status"] == "pass"
+
+
+def test_idp_ca_scope_mismatch_fails(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)  # end-entity (no BasicConstraints cA)
+    crl = _make_crl(ca_key, ca, idp=_idp(only_contains_ca_certs=True))
+    _stub_download(m, monkeypatch, crl)
+
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+                          DEFAULTS + ["idp"])
+    assert res.status == "Error"
+    idp = next(c for c in res.checks if c["key"] == "idp")
+    assert idp["status"] == "fail"
+
+
+def test_idp_dp_name_match_passes_mismatch_fails(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+
+    matching = _idp(full_name=[x509.UniformResourceIdentifier("http://crl.test/ca.crl")])
+    crl = _make_crl(ca_key, ca, idp=matching)
+    _stub_download(m, monkeypatch, crl)
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+                          DEFAULTS + ["idp"])
+    assert res.status == "Valid", res.message
+
+    mismatch = _idp(full_name=[x509.UniformResourceIdentifier("http://other.test/x.crl")])
+    crl = _make_crl(ca_key, ca, idp=mismatch)
+    _stub_download(m, monkeypatch, crl)
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+                          DEFAULTS + ["idp"])
+    assert res.status == "Error"
+    idp = next(c for c in res.checks if c["key"] == "idp")
+    assert idp["status"] == "fail"
 
 
 def test_deselecting_cert_status_keeps_revoked_off_status(m, monkeypatch):

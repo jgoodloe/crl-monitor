@@ -246,14 +246,17 @@ recorded but no longer flips the monitor to an error.
 | **thisUpdate sanity** | `thisUpdate` (last update) is present and not future-dated (5 min skew). |
 | **nextUpdate freshness** | `nextUpdate` is present and not already in the past (stale CRL). |
 | **CRL Number** | The `cRLNumber` extension is present and has not regressed below the last value seen for this monitor (a rollback can indicate a replayed/stale CRL). Off by default. |
+| **Signature algorithm strength** | The CRL is signed with a modern algorithm — fails on a weak hash (MD5 / SHA-1). EdDSA and SHA-256+ pass. Off by default. |
+| **Issuing Distribution Point** | The CRL's `issuingDistributionPoint` scope is consistent with the certificate (user/CA/attribute-cert scope) and the fetched URL. An absent IDP passes (the extension is optional). Off by default. |
 | **Response-time threshold** | The CRL download round-trip is under a configurable limit (ms). Off by default. |
 
 Selection works at two levels:
 
 - **Global default** (Settings → *Default verification tests*) applies to every
   monitor that doesn't override it. Stored in the `default_tests` setting. The
-  default set is everything *except* **CRL Number** and **Response-time
-  threshold**, which are opt-in.
+  default set is everything *except* **CRL Number**, **Signature algorithm
+  strength**, **Issuing Distribution Point**, and **Response-time threshold**,
+  which are opt-in.
 - **Per monitor** (Add/Edit → *Verification tests*) either inherits the global
   default or pins its own set.
 
