@@ -242,6 +242,41 @@ def test_resolve_max_crl_bytes_reads_setting(m):
         assert m.resolve_max_crl_bytes(db) == m.MAX_CRL_BYTES
 
 
+def test_schedule_settings_round_trip(m):
+    """Global scheduling defaults are exposed and updatable; an unknown mode
+    falls back to 'frequency'."""
+    client = m.app.test_client()
+    s = client.get("/api/settings").get_json()
+    assert s["default_schedule_mode"] in ("frequency", "next_update")
+    assert "default_safety_window_min" in s
+
+    r = client.put("/api/settings",
+                   json={"default_schedule_mode": "next_update",
+                         "default_safety_window_min": 120}, headers=_csrf())
+    assert r.status_code == 200
+    out = r.get_json()
+    assert out["default_schedule_mode"] == "next_update"
+    assert int(out["default_safety_window_min"]) == 120
+
+    r = client.put("/api/settings", json={"default_schedule_mode": "bogus"},
+                   headers=_csrf())
+    assert r.get_json()["default_schedule_mode"] == "frequency"
+
+
+def test_monitor_schedule_fields_round_trip(m):
+    """Per-monitor schedule_mode / safety_window_min persist; an unknown mode
+    normalizes to None (inherit the global default)."""
+    client = m.app.test_client()
+    rid = _make_monitor(client, schedule_mode="next_update", safety_window_min=45)
+    d = client.get(f"/api/monitors/{rid}").get_json()
+    assert d["schedule_mode"] == "next_update"
+    assert d["safety_window_min"] == 45
+
+    rid2 = _make_monitor(client, schedule_mode="nope")
+    d2 = client.get(f"/api/monitors/{rid2}").get_json()
+    assert d2["schedule_mode"] is None
+
+
 def test_update_push_url_is_authoritative(m):
     client = m.app.test_client()
     url = "https://status.example.com/api/push/TOK1"

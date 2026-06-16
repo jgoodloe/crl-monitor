@@ -166,6 +166,21 @@
         <input type="url" id="f_kuma" placeholder="https://status.example.com/api/push/TOKEN">
       </div>
     </div>
+    <div class="row">
+      <div>
+        <label>Scheduling</label>
+        <select id="f_sched">
+          <option value="">Use the global default</option>
+          <option value="frequency">Fixed frequency (above)</option>
+          <option value="next_update">From CRL nextUpdate + safety window</option>
+        </select>
+      </div>
+      <div>
+        <label>Safety window (minutes)
+          <span class="muted">— added after the CRL's nextUpdate; blank inherits</span></label>
+        <input type="number" id="f_safety" min="0" placeholder="inherit global default">
+      </div>
+    </div>
     <div class="check">
       <input type="checkbox" id="f_enabled" checked>
       <label for="f_enabled" style="margin:0">Enabled</label>
@@ -225,6 +240,20 @@
     <div id="s_tests_box" class="tests-box"></div>
     <label style="margin-top:16px">Default response-time threshold (ms)</label>
     <input type="number" id="s_resptime" min="1" placeholder="5000">
+    <label style="margin-top:16px">Default scheduling</label>
+    <div class="muted small" style="margin-bottom:6px">
+      How the next check is scheduled for monitors set to inherit the default.
+    </div>
+    <select id="s_sched">
+      <option value="frequency">Fixed frequency (each monitor's interval)</option>
+      <option value="next_update">From CRL nextUpdate + safety window</option>
+    </select>
+    <label style="margin-top:16px">Default safety window (minutes)</label>
+    <div class="muted small" style="margin-bottom:6px">
+      Added after the CRL's nextUpdate before the next check, to allow for
+      publication and propagation delays.
+    </div>
+    <input type="number" id="s_safety" min="0" placeholder="60">
     <label style="margin-top:16px">Maximum CRL download size (MiB)</label>
     <div class="muted small" style="margin-bottom:6px">
       CRLs larger than this are rejected. Raise it for large CRLs (some
@@ -433,9 +462,10 @@ function testPills(checks) {
 function openForm() {
   editingId = null;
   document.getElementById('formTitle').textContent = 'Add monitor';
-  ['f_alias','f_cert','f_issuer','f_uri','f_kuma','f_resptime'].forEach(i => document.getElementById(i).value = '');
+  ['f_alias','f_cert','f_issuer','f_uri','f_kuma','f_resptime','f_safety'].forEach(i => document.getElementById(i).value = '');
   document.getElementById('f_kuma').placeholder = 'https://status.example.com/api/push/TOKEN';
   document.getElementById('f_freq').value = 60;
+  document.getElementById('f_sched').value = '';
   document.getElementById('f_enabled').checked = true;
   document.getElementById('f_tests_inherit').checked = true;
   renderTestChecks('f_tests_box', 'f_t_', globalDefaultTests);
@@ -459,6 +489,8 @@ function populateForm(r) {
   document.getElementById('f_freq').value = r.frequency_min;
   document.getElementById('f_enabled').checked = r.enabled;
   document.getElementById('f_resptime').value = (r.response_time_ms == null ? '' : r.response_time_ms);
+  document.getElementById('f_sched').value = r.schedule_mode || '';
+  document.getElementById('f_safety').value = (r.safety_window_min == null ? '' : r.safety_window_min);
   const inherit = (r.tests == null);
   document.getElementById('f_tests_inherit').checked = inherit;
   renderTestChecks('f_tests_box', 'f_t_', inherit ? globalDefaultTests : r.tests);
@@ -500,6 +532,10 @@ async function saveForm() {
     // '' => inherit the global default threshold; a number => this monitor's own.
     response_time_ms: document.getElementById('f_resptime').value === ''
       ? null : parseInt(document.getElementById('f_resptime').value),
+    // '' => inherit the global scheduling default; else this monitor's own.
+    schedule_mode: document.getElementById('f_sched').value || null,
+    safety_window_min: document.getElementById('f_safety').value === ''
+      ? null : parseInt(document.getElementById('f_safety').value),
   };
   const btn = document.getElementById('saveBtn');
   btn.disabled = true;
@@ -568,6 +604,10 @@ async function openSettings() {
   globalDefaultTests = s.default_tests || [];
   renderTestChecks('s_tests_box', 's_t_', globalDefaultTests);
   document.getElementById('s_resptime').value = s.default_response_time_ms || '';
+  document.getElementById('s_sched').value =
+    (s.default_schedule_mode === 'next_update') ? 'next_update' : 'frequency';
+  document.getElementById('s_safety').value =
+    (s.default_safety_window_min == null ? '' : s.default_safety_window_min);
   const maxBytes = parseInt(s.max_crl_bytes) || (16 * 1024 * 1024);
   document.getElementById('s_maxcrl').value = Math.round(maxBytes / (1024 * 1024));
   document.getElementById('settingsOverlay').classList.add('open');
@@ -580,6 +620,11 @@ async function saveSettings() {
     uptime_kuma_logging: document.getElementById('s_kuma').checked,
     default_tests: selectedTests('s_tests_box'),
     default_response_time_ms: parseInt(document.getElementById('s_resptime').value) || 5000,
+    default_schedule_mode: document.getElementById('s_sched').value || 'frequency',
+    default_safety_window_min: (() => {
+      const v = parseInt(document.getElementById('s_safety').value);
+      return (isNaN(v) || v < 0) ? 60 : v;
+    })(),
     max_crl_bytes: (parseInt(document.getElementById('s_maxcrl').value) || 16) * 1024 * 1024,
   });
   globalDefaultTests = selectedTests('s_tests_box');

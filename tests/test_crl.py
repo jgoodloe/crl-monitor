@@ -198,6 +198,33 @@ def test_too_large_crl_reports_configured_limit(m, monkeypatch):
     assert "12345" in parse["message"]
 
 
+def test_compute_next_run_frequency_mode(m):
+    now = datetime.now(timezone.utc)
+    nu = (now + timedelta(days=5)).isoformat()
+    nr = m._compute_next_run(now, "frequency", 60, 30, nu)
+    assert abs((nr - (now + timedelta(minutes=60))).total_seconds()) < 1
+
+
+def test_compute_next_run_next_update_adds_safety(m):
+    now = datetime.now(timezone.utc)
+    nu = now + timedelta(days=2)
+    nr = m._compute_next_run(now, "next_update", 60, 90, nu.isoformat())
+    assert abs((nr - (nu + timedelta(minutes=90))).total_seconds()) < 1
+
+
+def test_compute_next_run_falls_back_when_stale(m):
+    now = datetime.now(timezone.utc)
+    nu = (now - timedelta(days=1)).isoformat()  # nextUpdate already in the past
+    nr = m._compute_next_run(now, "next_update", 45, 60, nu)
+    assert abs((nr - (now + timedelta(minutes=45))).total_seconds()) < 1
+
+
+def test_compute_next_run_falls_back_when_no_next_update(m):
+    now = datetime.now(timezone.utc)
+    nr = m._compute_next_run(now, "next_update", 45, 60, None)
+    assert abs((nr - (now + timedelta(minutes=45))).total_seconds()) < 1
+
+
 def test_deselecting_cert_status_keeps_revoked_off_status(m, monkeypatch):
     ca_key, ca = _make_ca()
     leaf = _make_leaf(ca_key, ca, serial=999)

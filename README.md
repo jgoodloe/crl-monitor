@@ -44,11 +44,29 @@ Open <http://localhost:8080>. Click **+ Add monitor** and provide:
 - **CRL URL** — optional. If left blank, the app uses the CRL distribution point
   embedded in the certificate's `CRLDistributionPoints` extension.
 - **Frequency**, **Uptime Kuma URL**, **Enabled** — as needed.
+- **Scheduling** — choose how the next check is timed (see below).
 
 The first check runs immediately; subsequent checks run on the schedule. Use
 **Check** on any row to run an on-demand check, or **Clone** to open the form
 pre-filled from an existing monitor as a new copy (handy for monitoring several
 certs from the same CA / CRL).
+
+### Scheduling modes
+
+Each monitor can be scheduled one of two ways (per-monitor, or inheriting a
+global default set in **Settings**):
+
+- **Fixed frequency** — re-check every *N* minutes (the monitor's frequency).
+- **From CRL nextUpdate** — re-check at the CRL's own `nextUpdate` plus a
+  **safety window** (minutes). This polls in step with the CA's publication
+  cycle instead of on a fixed clock; the safety window allows for the CA
+  publishing the fresh CRL and for propagation. If a CRL has no usable
+  `nextUpdate`, or the computed time is already in the past (a stale CRL), the
+  monitor falls back to its fixed frequency so it keeps polling.
+
+Both the mode and the safety window can be configured globally (**Settings**)
+and overridden per monitor; leaving a monitor's value blank inherits the global
+default.
 
 ## Configuration (environment variables)
 

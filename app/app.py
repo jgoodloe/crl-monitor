@@ -144,6 +144,23 @@ DEFAULT_TESTS = FOUNDATIONAL_KEYS + [
 # Fallback response-time threshold (ms) when neither monitor nor global set.
 DEFAULT_RESPONSE_TIME_MS = 5000
 
+# --------------------------------------------------------------------------- #
+# Scheduling modes
+# --------------------------------------------------------------------------- #
+# "frequency"   — re-check every `frequency_min` minutes (the classic behaviour).
+# "next_update" — re-check shortly after the CRL's own nextUpdate, i.e. at
+#                 nextUpdate + a safety window (minutes) to allow for the CA
+#                 publishing the fresh CRL and for propagation. Falls back to the
+#                 frequency interval when the CRL has no usable nextUpdate or the
+#                 computed time is already in the past.
+SCHEDULE_FREQUENCY = "frequency"
+SCHEDULE_NEXT_UPDATE = "next_update"
+SCHEDULE_MODES = (SCHEDULE_FREQUENCY, SCHEDULE_NEXT_UPDATE)
+DEFAULT_SCHEDULE_MODE = SCHEDULE_FREQUENCY
+# Fallback safety window (minutes) added after nextUpdate when neither monitor
+# nor global sets one.
+DEFAULT_SAFETY_WINDOW_MIN = 60
+
 
 def parse_tests(value):
     """Parse a stored tests value into a clean list of known test keys.
@@ -184,6 +201,9 @@ CREATE TABLE IF NOT EXISTS monitors (
     uptime_kuma_url TEXT NOT NULL DEFAULT '',
     tests           TEXT,
     response_time_ms INTEGER,
+    -- NULL on both => inherit the global scheduling defaults.
+    schedule_mode    TEXT,
+    safety_window_min INTEGER,
     last_checks     TEXT,
     last_run        TEXT,
     next_run        TEXT,
@@ -250,6 +270,11 @@ DEFAULT_SETTINGS = {
     # Global default response-time threshold (ms) for the response_time test,
     # used by any monitor that doesn't set its own.
     "default_response_time_ms": str(DEFAULT_RESPONSE_TIME_MS),
+    # Global default scheduling mode ("frequency" | "next_update") and the safety
+    # window (minutes) added after a CRL's nextUpdate in next_update mode. Applied
+    # to any monitor that doesn't set its own.
+    "default_schedule_mode": DEFAULT_SCHEDULE_MODE,
+    "default_safety_window_min": str(DEFAULT_SAFETY_WINDOW_MIN),
     # Maximum accepted CRL download size (bytes). Configurable at runtime so an
     # operator can raise it for large CRLs (e.g. some US-government CAs publish
     # CRLs of tens of MiB). Defaults to the MAX_CRL_BYTES env value.
@@ -274,9 +299,25 @@ def raw_db():
     return conn
 
 
+def _migrate(db):
+    """Add columns introduced after the initial schema to pre-existing DBs.
+
+    CREATE TABLE IF NOT EXISTS won't alter an existing table, so additive
+    columns are applied here. Each is nullable, so old rows simply inherit the
+    global defaults until edited."""
+    have = {r["name"] for r in db.execute("PRAGMA table_info(monitors)").fetchall()}
+    for col, ddl in (
+        ("schedule_mode", "ALTER TABLE monitors ADD COLUMN schedule_mode TEXT"),
+        ("safety_window_min", "ALTER TABLE monitors ADD COLUMN safety_window_min INTEGER"),
+    ):
+        if col not in have:
+            db.execute(ddl)
+
+
 def init_db():
     with closing(raw_db()) as db:
         db.executescript(SCHEMA)
+        _migrate(db)
         for k, v in DEFAULT_SETTINGS.items():
             db.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -845,6 +886,50 @@ def resolve_max_crl_bytes(db):
         return MAX_CRL_BYTES
 
 
+def resolve_schedule_mode(db, row):
+    """The scheduling mode for this monitor: its own if set, else the global
+    default, else "frequency". Unknown values fall back to the default."""
+    own = row["schedule_mode"] if "schedule_mode" in row.keys() else None
+    if own in SCHEDULE_MODES:
+        return own
+    glob = get_setting(db, "default_schedule_mode", DEFAULT_SCHEDULE_MODE)
+    return glob if glob in SCHEDULE_MODES else DEFAULT_SCHEDULE_MODE
+
+
+def resolve_safety_window_min(db, row):
+    """The safety window (minutes, >= 0) added after nextUpdate: the monitor's
+    own if set, else the global default."""
+    own = row["safety_window_min"] if "safety_window_min" in row.keys() else None
+    if own is not None:
+        try:
+            return max(0, int(own))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(0, int(get_setting(db, "default_safety_window_min",
+                                      str(DEFAULT_SAFETY_WINDOW_MIN))))
+    except (TypeError, ValueError):
+        return DEFAULT_SAFETY_WINDOW_MIN
+
+
+def _compute_next_run(now, mode, frequency_min, safety_window_min, next_update_iso):
+    """When the next check should run.
+
+    In "next_update" mode, schedule at the CRL's nextUpdate plus the safety
+    window. Fall back to the frequency interval when nextUpdate is missing /
+    unparseable, or when the computed time is already in the past (a stale CRL),
+    so a stale or nextUpdate-less monitor keeps polling rather than stalling.
+    """
+    freq = now + timedelta(minutes=max(1, int(frequency_min or 1)))
+    if mode != SCHEDULE_NEXT_UPDATE:
+        return freq
+    nu = _parse_ts(next_update_iso)
+    if nu is None:
+        return freq
+    candidate = nu + timedelta(minutes=max(0, int(safety_window_min or 0)))
+    return candidate if candidate > now else freq
+
+
 def check_monitor(db, row):
     rid = row["id"]
     alias = row["cert_alias"]
@@ -855,10 +940,13 @@ def check_monitor(db, row):
     enabled_tests = resolve_tests(db, row)
     threshold_ms = resolve_threshold_ms(db, row)
     max_bytes = resolve_max_crl_bytes(db)
+    schedule_mode = resolve_schedule_mode(db, row)
+    safety_window_min = resolve_safety_window_min(db, row)
     if debug:
-        log.info("[Worker] checking '%s' (id=%s) uri=%s tests=%s threshold=%sms max_bytes=%s",
+        log.info("[Worker] checking '%s' (id=%s) uri=%s tests=%s threshold=%sms "
+                 "max_bytes=%s schedule=%s safety=%smin",
                  alias, rid, row["crl_uri"], ",".join(enabled_tests) or "none",
-                 threshold_ms, max_bytes)
+                 threshold_ms, max_bytes, schedule_mode, safety_window_min)
 
     result = run_crl_check(
         row["cert_pem"], row["issuer_pem"], row["crl_uri"], enabled_tests,
@@ -866,7 +954,10 @@ def check_monitor(db, row):
     )
 
     now = datetime.now(timezone.utc)
-    next_run = (now + timedelta(minutes=row["frequency_min"])).isoformat()
+    next_run = _compute_next_run(
+        now, schedule_mode, row["frequency_min"], safety_window_min,
+        result.next_update,
+    ).isoformat()
     prev_status = row["status"]
 
     db.execute(
@@ -1283,6 +1374,11 @@ def monitor_to_dict(row, include_pem=True):
         # None means "inherit the global default threshold".
         "response_time_ms": (row["response_time_ms"]
                              if "response_time_ms" in row.keys() else None),
+        # None on either means "inherit the global scheduling default".
+        "schedule_mode": (row["schedule_mode"]
+                          if "schedule_mode" in row.keys() else None),
+        "safety_window_min": (row["safety_window_min"]
+                              if "safety_window_min" in row.keys() else None),
         "last_checks": _load_checks(row["last_checks"] if "last_checks" in row.keys() else None),
         "last_run": row["last_run"],
         "next_run": row["next_run"],
@@ -1361,6 +1457,19 @@ def _int_or_none(value):
         return None
 
 
+def _schedule_mode_or_none(value):
+    """Normalize an incoming schedule_mode; blank/None/unknown -> None (inherit)."""
+    if value is None or value == "":
+        return None
+    return value if value in SCHEDULE_MODES else None
+
+
+def _safety_window_or_none(value):
+    """Parse an optional safety window (minutes, clamped >= 0); blank -> None."""
+    n = _int_or_none(value)
+    return None if n is None else max(0, n)
+
+
 def _validate_payload(data, partial=False):
     errors = []
     if not partial or "cert_alias" in data:
@@ -1392,9 +1501,10 @@ def create_monitor():
     cur = db.execute(
         """INSERT INTO monitors
            (cert_alias, cert_pem, issuer_pem, crl_uri, frequency_min,
-            enabled, uptime_kuma_url, tests, response_time_ms, next_run, status,
+            enabled, uptime_kuma_url, tests, response_time_ms,
+            schedule_mode, safety_window_min, next_run, status,
             last_message, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             data["cert_alias"].strip(),
             data["cert_pem"].strip(),
@@ -1405,6 +1515,8 @@ def create_monitor():
             (data.get("uptime_kuma_url") or "").strip(),
             _tests_to_db(data.get("tests")),
             _int_or_none(data.get("response_time_ms")),
+            _schedule_mode_or_none(data.get("schedule_mode")),
+            _safety_window_or_none(data.get("safety_window_min")),
             now,  # schedule an immediate first run
             "Unknown",
             "Configuration created.",
@@ -1449,6 +1561,10 @@ def update_monitor(rid):
         "tests": _tests_to_db(data["tests"]) if "tests" in data else row["tests"],
         "response_time_ms": (_int_or_none(data["response_time_ms"])
                              if "response_time_ms" in data else row["response_time_ms"]),
+        "schedule_mode": (_schedule_mode_or_none(data["schedule_mode"])
+                          if "schedule_mode" in data else row["schedule_mode"]),
+        "safety_window_min": (_safety_window_or_none(data["safety_window_min"])
+                              if "safety_window_min" in data else row["safety_window_min"]),
     }
     # Re-check immediately if cert material changed.
     next_run = row["next_run"]
@@ -1458,12 +1574,14 @@ def update_monitor(rid):
     db.execute(
         """UPDATE monitors SET cert_alias=?, cert_pem=?, issuer_pem=?, crl_uri=?,
                frequency_min=?, enabled=?, uptime_kuma_url=?, tests=?,
-               response_time_ms=?, next_run=?, updated_at=?
+               response_time_ms=?, schedule_mode=?, safety_window_min=?,
+               next_run=?, updated_at=?
            WHERE id=?""",
         (
             fields["cert_alias"], fields["cert_pem"], fields["issuer_pem"],
             fields["crl_uri"], fields["frequency_min"], fields["enabled"],
             fields["uptime_kuma_url"], fields["tests"], fields["response_time_ms"],
+            fields["schedule_mode"], fields["safety_window_min"],
             next_run, now_iso(), rid,
         ),
     )
@@ -1708,6 +1826,11 @@ def put_settings():
         elif k == "max_crl_bytes":
             n = _int_or_none(v)
             sv = str(n if (n and n > 0) else MAX_CRL_BYTES)
+        elif k == "default_schedule_mode":
+            sv = v if v in SCHEDULE_MODES else DEFAULT_SCHEDULE_MODE
+        elif k == "default_safety_window_min":
+            n = _int_or_none(v)
+            sv = str(max(0, n) if n is not None else DEFAULT_SAFETY_WINDOW_MIN)
         elif v is True:
             sv = "true"
         elif v is False:
