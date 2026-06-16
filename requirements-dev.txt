@@ -1,0 +1,2 @@
+# Development/test dependencies (installed on top of requirements.txt).
+pytest==8.3.4

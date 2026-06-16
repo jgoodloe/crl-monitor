@@ -1,0 +1,46 @@
+services:
+  crl-monitor:
+    build: .
+    # Or use a prebuilt image instead of build:
+    # image: ghcr.io/jgoodloe/crl-monitor:latest
+    container_name: crl-monitor
+    restart: unless-stopped
+    ports:
+      # Bind to loopback only: the app has no authentication, so expose it
+      # through your reverse proxy rather than directly. Point the proxy
+      # upstream at 127.0.0.1:8080. To serve it directly (no proxy), change
+      # this to "8080:8080" AND set TRUSTED_PROXY_HOPS=0 so forwarded headers
+      # can't be spoofed.
+      - "127.0.0.1:8080:8080"
+    environment:
+      PORT: "8080"
+      # Set to a subpath (e.g. "/crl") if your reverse proxy serves the app
+      # under a path rather than its own (sub)domain. Leave empty for root.
+      URL_PREFIX: "${URL_PREFIX:-}"
+      # Scheduler tick (seconds): how often due monitors are evaluated.
+      SCHEDULER_INTERVAL: "${SCHEDULER_INTERVAL:-30}"
+      # Per-request CRL HTTP timeout (seconds).
+      CRL_TIMEOUT: "${CRL_TIMEOUT:-30}"
+      # Maximum CRL download size (bytes); larger CRLs are rejected.
+      MAX_CRL_BYTES: "${MAX_CRL_BYTES:-16777216}"
+      # Rows of status history kept per monitor.
+      HISTORY_LIMIT: "${HISTORY_LIMIT:-200}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # Reverse-proxy hops to trust for X-Forwarded-* (0 disables ProxyFix).
+      TRUSTED_PROXY_HOPS: "${TRUSTED_PROXY_HOPS:-1}"
+      # SSRF egress controls. Block private (RFC1918/ULA) destinations; loopback
+      # and link-local (incl. cloud metadata) are always blocked. Internal-PKI
+      # users can set CRL_BLOCK_PRIVATE=false and/or allowlist specific hosts.
+      CRL_BLOCK_PRIVATE: "${CRL_BLOCK_PRIVATE:-true}"
+      CRL_ALLOWED_HOSTS: "${CRL_ALLOWED_HOSTS:-}"
+      # Abuse limits.
+      MAX_PEM_BYTES: "${MAX_PEM_BYTES:-32768}"
+      MAX_MONITORS: "${MAX_MONITORS:-100}"
+      RATE_LIMIT_MUTATE: "${RATE_LIMIT_MUTATE:-60}"
+      RATE_LIMIT_CHECK: "${RATE_LIMIT_CHECK:-20}"
+    volumes:
+      # Persistent SQLite database (survives container rebuilds).
+      - crl_data:/data
+
+volumes:
+  crl_data:

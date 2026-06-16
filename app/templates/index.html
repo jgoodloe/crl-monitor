@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CRL Monitor</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --panel2: #273449; --border: #334155;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --accent2: #0ea5e9;
+    --good: #22c55e; --bad: #ef4444; --warn: #f59e0b; --unknown: #64748b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 18px; margin: 0; display: flex; align-items: center; gap: 10px; }
+  header h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+  .toolbar { display: flex; gap: 8px; align-items: center; }
+  main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  button {
+    background: var(--accent2); color: #00121f; border: 0; border-radius: 6px;
+    padding: 8px 14px; font-weight: 600; cursor: pointer; font-size: 13px;
+  }
+  button:hover { background: var(--accent); }
+  button.secondary { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
+  button.secondary:hover { background: var(--border); }
+  button.danger { background: #7f1d1d; color: #fee2e2; }
+  button.danger:hover { background: #991b1b; }
+  button.tiny { padding: 4px 9px; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  tr:last-child td { border-bottom: 0; }
+  tr:hover td { background: var(--panel2); }
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 999px;
+    font-weight: 700; font-size: 12px;
+  }
+  .badge.Valid { background: rgba(34,197,94,.15); color: var(--good); }
+  .badge.Revoked { background: rgba(239,68,68,.15); color: var(--bad); }
+  .badge.Error { background: rgba(245,158,11,.15); color: var(--warn); }
+  .badge.Unknown { background: rgba(100,116,139,.2); color: var(--muted); }
+  .muted { color: var(--muted); }
+  .msg { font-size: 12px; min-height: 16px; }
+  .actions { display: flex; gap: 6px; }
+  .empty { text-align: center; padding: 48px; color: var(--muted); }
+  /* Modal */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none;
+    align-items: flex-start; justify-content: center; padding: 40px 16px; z-index: 100; overflow:auto;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    width: 100%; max-width: 640px; padding: 24px;
+  }
+  .modal h2 { margin: 0 0 16px; font-size: 16px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; font-weight: 600; }
+  input[type=text], input[type=number], input[type=url], textarea {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 9px 10px; font-size: 13px; font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 90px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+  .row { display: flex; gap: 14px; }
+  .row > div { flex: 1; }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+  .check input { width: auto; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+  .errors { color: var(--bad); font-size: 12px; margin-top: 8px; white-space: pre-line; }
+  .hist-row { display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-bottom:1px solid var(--border); }
+  .hist-row:last-child { border-bottom:0; }
+  .small { font-size: 12px; }
+  .settings-row { display:flex; align-items:center; gap:10px; padding:8px 0; }
+  .settings-row input { width:auto; }
+  code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .tests-box { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px; }
+  .tests-box.disabled { opacity: .45; pointer-events: none; }
+  .tests-box .check { margin: 0; }
+  .tests-box label { margin: 0; color: var(--text); }
+  .tests-group-head { font-size: 11px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .03em; margin: 6px 0 2px; }
+  .tests-group-head:first-child { margin-top: 0; }
+  .check-pills { display: flex; flex-wrap: wrap; gap: 4px; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+    font-weight: 600; border: 1px solid var(--border); }
+  .pill.pass { background: rgba(34,197,94,.12); color: var(--good); border-color: rgba(34,197,94,.3); }
+  .pill.fail { background: rgba(239,68,68,.12); color: var(--bad); border-color: rgba(239,68,68,.3); }
+  .pill.skip { background: rgba(100,116,139,.15); color: var(--muted); }
+  .modal.wide { max-width: 880px; }
+  .rep-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  .rep-controls > div { display: flex; flex-direction: column; }
+  .rep-controls input[type=datetime-local], .rep-controls select { width: auto; }
+  .rep-tabs { display: flex; gap: 6px; margin: 16px 0 10px; }
+  .rep-tabs button.active { background: var(--accent2); color: #00121f; }
+  .mon-list { display: flex; flex-wrap: wrap; gap: 4px 14px; max-height: 96px; overflow:auto;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .mon-list .check { margin: 0; }
+  .uptime-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; margin-bottom: 10px; }
+  .uptime-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+  .uptime-pct { font-size: 20px; font-weight: 800; }
+  .bar { height: 8px; border-radius: 4px; background: var(--bad); overflow: hidden; margin: 8px 0; }
+  .bar > span { display:block; height:100%; background: var(--good); }
+  .dt-row { display:grid; grid-template-columns: 150px 80px 1fr; gap: 8px; padding: 6px 0;
+    border-top: 1px dashed var(--border); align-items: start; }
+  .dt-row.head { color: var(--muted); font-weight:600; border-top: 0; }
+  .dt-comment { display:flex; gap:6px; margin-top:4px; }
+  .dt-comment input { padding: 5px 8px; }
+  .excluded-tag { color: var(--muted); font-size: 11px; }
+  .maint-row { display:flex; justify-content:space-between; gap:10px; padding:6px 0;
+    border-top: 1px dashed var(--border); align-items:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="dot"></span> CRL Monitor</h1>
+  <div class="toolbar">
+    <span class="msg muted" id="globalMsg"></span>
+    <button class="secondary" onclick="openReports()">Reports</button>
+    <button class="secondary" onclick="openSettings()">Settings</button>
+    <button onclick="openForm()">+ Add monitor</button>
+  </div>
+</header>
+
+<main>
+  <table id="table">
+    <thead>
+      <tr>
+        <th>Alias</th><th>Status</th><th>Message</th><th>Download</th>
+        <th>Next update</th><th>Last run</th><th>Freq</th><th></th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">No monitors configured yet. Click <b>+ Add monitor</b> to begin.</div>
+</main>
+
+<!-- Add/Edit modal -->
+<div class="overlay" id="formOverlay">
+  <div class="modal">
+    <h2 id="formTitle">Add monitor</h2>
+    <label>Alias *</label>
+    <input type="text" id="f_alias" placeholder="e.g. DHS PIV signing cert">
+    <label>Certificate to check (PEM) *</label>
+    <textarea id="f_cert" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+    <label>Issuer certificate (PEM) *</label>
+    <textarea id="f_issuer" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+    <label>CRL URL <span class="muted">(optional — falls back to the cert's CRL Distribution Points extension)</span></label>
+    <input type="url" id="f_uri" placeholder="http://crl.example.gov/ca.crl">
+    <div class="row">
+      <div>
+        <label>Check frequency (minutes)</label>
+        <input type="number" id="f_freq" value="60" min="1">
+      </div>
+      <div>
+        <label>Uptime Kuma push URL (optional)</label>
+        <input type="url" id="f_kuma" placeholder="https://status.example.com/api/push/TOKEN">
+      </div>
+    </div>
+    <div class="check">
+      <input type="checkbox" id="f_enabled" checked>
+      <label for="f_enabled" style="margin:0">Enabled</label>
+    </div>
+
+    <label style="margin-top:18px">Verification tests</label>
+    <div class="muted small" style="margin-bottom:6px">
+      Foundational URL resolution, reachability, HTTP 200 and CRL parsing always
+      run. Choose which additional tests determine this monitor's status.
+    </div>
+    <div class="check">
+      <input type="checkbox" id="f_tests_inherit" onchange="toggleTestInherit()">
+      <label for="f_tests_inherit" style="margin:0">Use the global default set</label>
+    </div>
+    <div id="f_tests_box" class="tests-box"></div>
+
+    <label style="margin-top:14px">Response-time threshold (ms)
+      <span class="muted">— only used by the “Response-time threshold” test; blank inherits the global default</span></label>
+    <input type="number" id="f_resptime" min="1" placeholder="inherit global default">
+
+    <div class="errors" id="formErrors"></div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeForm()">Cancel</button>
+      <button onclick="saveForm()" id="saveBtn">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- History modal -->
+<div class="overlay" id="histOverlay">
+  <div class="modal">
+    <h2 id="histTitle">History</h2>
+    <div id="histBody" class="small"></div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeHist()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings modal -->
+<div class="overlay" id="settingsOverlay">
+  <div class="modal">
+    <h2>Settings</h2>
+    <div class="settings-row">
+      <input type="checkbox" id="s_debug"><label for="s_debug" style="margin:0">Debug logging</label>
+    </div>
+    <div class="settings-row">
+      <input type="checkbox" id="s_failures"><label for="s_failures" style="margin:0">Log only failures</label>
+    </div>
+    <div class="settings-row">
+      <input type="checkbox" id="s_kuma"><label for="s_kuma" style="margin:0">Log Uptime Kuma pushes</label>
+    </div>
+    <label style="margin-top:16px">Default verification tests</label>
+    <div class="muted small" style="margin-bottom:6px">
+      Applied to any monitor set to “Use the global default set”.
+    </div>
+    <div id="s_tests_box" class="tests-box"></div>
+    <label style="margin-top:16px">Default response-time threshold (ms)</label>
+    <input type="number" id="s_resptime" min="1" placeholder="5000">
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeSettings()">Cancel</button>
+      <button onclick="saveSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Reports modal -->
+<div class="overlay" id="reportsOverlay">
+  <div class="modal wide">
+    <h2>Reports</h2>
+    <div class="rep-controls">
+      <div>
+        <label style="margin:0 0 4px">From</label>
+        <input type="datetime-local" id="rep_from">
+      </div>
+      <div>
+        <label style="margin:0 0 4px">To</label>
+        <input type="datetime-local" id="rep_to">
+      </div>
+      <div>
+        <label style="margin:0 0 4px">Quick range</label>
+        <select id="rep_quick" onchange="applyQuickRange()">
+          <option value="">Custom</option>
+          <option value="24">Last 24 hours</option>
+          <option value="168" selected>Last 7 days</option>
+          <option value="720">Last 30 days</option>
+          <option value="2160">Last 90 days</option>
+        </select>
+      </div>
+      <div>
+        <label style="margin:0 0 4px">Down counts as</label>
+        <select id="rep_down">
+          <option value="not_valid">Anything not Valid</option>
+          <option value="error_only">Only errors (Revoked = up)</option>
+        </select>
+      </div>
+      <div>
+        <label style="margin:0 0 4px">Disabled periods</label>
+        <select id="rep_disabled">
+          <option value="exclude">Excluded from totals</option>
+          <option value="down">Count as downtime</option>
+          <option value="ignore">Ignore (use status)</option>
+        </select>
+      </div>
+      <div class="check" style="margin:0">
+        <input type="checkbox" id="rep_maint" checked>
+        <label for="rep_maint" style="margin:0">Exclude maintenance</label>
+      </div>
+    </div>
+
+    <label style="margin-top:12px">Monitors</label>
+    <div class="muted small" style="margin-bottom:6px">None selected = all monitors.</div>
+    <div id="rep_monitors" class="mon-list"></div>
+
+    <div class="rep-tabs">
+      <button class="secondary" id="rep_tab_uptime" onclick="setReportTab('uptime')">Uptime</button>
+      <button class="secondary" id="rep_tab_downtimes" onclick="setReportTab('downtimes')">All downtimes</button>
+      <button class="secondary" id="rep_tab_maint" onclick="setReportTab('maint')">Maintenance windows</button>
+      <span style="flex:1"></span>
+      <button onclick="runReport()">Run report</button>
+    </div>
+
+    <div id="rep_body" class="small"></div>
+
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeReports()">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// All API calls are RELATIVE to the current page — this is what makes the app
+// work behind a reverse proxy at any subpath without configuration.
+const API = (p) => {
+  const base = window.location.pathname.replace(/\/+$/, "");
+  return base + "/api" + p;
+};
+// State-changing calls send X-Requested-With so the server can reject forged
+// cross-site requests (a cross-origin page can't set this header without a
+// CORS preflight, which the API does not grant).
+function mutate(url, method, body) {
+  const opts = { method, headers: { "X-Requested-With": "XMLHttpRequest" } };
+  if (body !== undefined) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  return fetch(url, opts);
+}
+let editingId = null;
+let AVAILABLE_TESTS = [];          // [{key,label}] from /api/tests
+let globalDefaultTests = [];       // current global default set
+let MONITORS = [];                 // last-loaded monitor rows, by reference
+
+// Look up an alias by id rather than threading attacker-controlled text through
+// inline event-handler attributes (where HTML-entity decoding would undo the
+// escaping and allow script injection).
+function aliasFor(id) {
+  const r = MONITORS.find(x => x.id === id);
+  return r ? r.cert_alias : '';
+}
+
+// Short labels for the compact result pills in the table.
+const SHORT_TEST = {
+  cert_load: 'load', crl_url: 'url', reachable: 'reachable',
+  http_200: 'http200', crl_parse: 'parse',
+  cert_status: 'status', crl_signature: 'signature', issuer_match: 'issuer',
+  this_update: 'thisUpdate', next_update: 'nextUpdate', response_time: 'respTime',
+};
+
+async function loadTests() {
+  try { AVAILABLE_TESTS = await (await fetch(API('/tests'))).json(); }
+  catch (e) { AVAILABLE_TESTS = []; }
+}
+
+function renderTestChecks(boxId, prefix, selected) {
+  selected = selected || [];
+  const groups = [
+    ['foundational', 'Foundational — resolve, download & parse (failing one skips the rest)'],
+    ['evaluation', 'Evaluation — inspect the CRL'],
+  ];
+  let html = '';
+  for (const [g, heading] of groups) {
+    const items = AVAILABLE_TESTS.filter(t => (t.group || 'evaluation') === g);
+    if (!items.length) continue;
+    html += `<div class="tests-group-head">${heading}</div>`;
+    html += items.map(t => `
+      <div class="check">
+        <input type="checkbox" id="${prefix}${t.key}" value="${t.key}" ${selected.includes(t.key) ? 'checked' : ''}>
+        <label for="${prefix}${t.key}">${esc(t.label)}</label>
+      </div>`).join('');
+  }
+  document.getElementById(boxId).innerHTML = html;
+}
+
+function selectedTests(boxId) {
+  return [...document.querySelectorAll('#' + boxId + ' input[type=checkbox]:checked')]
+    .map(c => c.value);
+}
+
+function toggleTestInherit() {
+  const inherit = document.getElementById('f_tests_inherit').checked;
+  const box = document.getElementById('f_tests_box');
+  if (inherit) renderTestChecks('f_tests_box', 'f_t_', globalDefaultTests);
+  box.classList.toggle('disabled', inherit);
+}
+
+function fmt(dt) {
+  if (!dt) return '—';
+  const d = new Date(dt);
+  return isNaN(d) ? dt : d.toLocaleString();
+}
+function flash(msg) {
+  const el = document.getElementById('globalMsg');
+  el.textContent = msg;
+  if (msg) setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 4000);
+}
+
+async function load() {
+  try {
+    const res = await fetch(API('/monitors'));
+    const data = await res.json();
+    MONITORS = data;
+    const rows = document.getElementById('rows');
+    document.getElementById('empty').style.display = data.length ? 'none' : 'block';
+    document.getElementById('table').style.display = data.length ? 'table' : 'none';
+    rows.innerHTML = '';
+    for (const r of data) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><b>${esc(r.cert_alias)}</b>${r.enabled ? '' : ' <span class="muted small">(disabled)</span>'}</td>
+        <td><span class="badge ${r.status}">${r.status}</span></td>
+        <td class="muted small">${esc(r.last_message || '')}${testPills(r.last_checks)}</td>
+        <td class="small">${r.response_ms != null ? r.response_ms + ' ms' : '—'}</td>
+        <td class="small">${fmt(r.next_update)}</td>
+        <td class="small">${fmt(r.last_run)}</td>
+        <td class="small">${r.frequency_min}m</td>
+        <td><div class="actions">
+          <button class="secondary tiny" onclick="checkNow(${r.id})">Check</button>
+          <button class="secondary tiny" onclick="toggleEnabled(${r.id}, ${r.enabled ? 'true' : 'false'})">${r.enabled ? 'Disable' : 'Enable'}</button>
+          <button class="secondary tiny" onclick="showHist(${r.id})">History</button>
+          <button class="secondary tiny" onclick="editRow(${r.id})">Edit</button>
+          <button class="secondary tiny" onclick="cloneRow(${r.id})">Clone</button>
+          <button class="danger tiny" onclick="delRow(${r.id})">Del</button>
+        </div></td>`;
+      rows.appendChild(tr);
+    }
+  } catch (e) { flash('Failed to load: ' + e.message); }
+}
+function esc(s) { return (s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function testPills(checks) {
+  if (!checks || !checks.length) return '';
+  const pills = checks.map(c =>
+    `<span class="pill ${c.status}" title="${esc((c.label || c.key) + ': ' + (c.message || ''))}">${esc(SHORT_TEST[c.key] || c.key)}</span>`
+  ).join('');
+  return `<div class="check-pills" style="margin-top:4px">${pills}</div>`;
+}
+
+function openForm() {
+  editingId = null;
+  document.getElementById('formTitle').textContent = 'Add monitor';
+  ['f_alias','f_cert','f_issuer','f_uri','f_kuma','f_resptime'].forEach(i => document.getElementById(i).value = '');
+  document.getElementById('f_kuma').placeholder = 'https://status.example.com/api/push/TOKEN';
+  document.getElementById('f_freq').value = 60;
+  document.getElementById('f_enabled').checked = true;
+  document.getElementById('f_tests_inherit').checked = true;
+  renderTestChecks('f_tests_box', 'f_t_', globalDefaultTests);
+  document.getElementById('f_tests_box').classList.add('disabled');
+  document.getElementById('formErrors').textContent = '';
+  document.getElementById('formOverlay').classList.add('open');
+}
+function closeForm() { document.getElementById('formOverlay').classList.remove('open'); }
+
+// Fill the add/edit form from a monitor record (used by both Edit and Clone).
+function populateForm(r) {
+  document.getElementById('f_alias').value = r.cert_alias || '';
+  document.getElementById('f_cert').value = r.cert_pem || '';
+  document.getElementById('f_issuer').value = r.issuer_pem || '';
+  document.getElementById('f_uri').value = r.crl_uri || '';
+  // The detail view returns the real push URL so it can be verified/edited
+  // directly. Saving stores exactly what's in the box (blank clears it).
+  const kuma = document.getElementById('f_kuma');
+  kuma.value = r.uptime_kuma_url || '';
+  kuma.placeholder = 'https://status.example.com/api/push/TOKEN';
+  document.getElementById('f_freq').value = r.frequency_min;
+  document.getElementById('f_enabled').checked = r.enabled;
+  document.getElementById('f_resptime').value = (r.response_time_ms == null ? '' : r.response_time_ms);
+  const inherit = (r.tests == null);
+  document.getElementById('f_tests_inherit').checked = inherit;
+  renderTestChecks('f_tests_box', 'f_t_', inherit ? globalDefaultTests : r.tests);
+  document.getElementById('f_tests_box').classList.toggle('disabled', inherit);
+  document.getElementById('formErrors').textContent = '';
+  document.getElementById('formOverlay').classList.add('open');
+}
+
+async function editRow(id) {
+  const res = await fetch(API('/monitors/' + id));
+  const r = await res.json();
+  editingId = id;
+  document.getElementById('formTitle').textContent = 'Edit monitor';
+  populateForm(r);
+}
+
+// Open the form pre-filled from an existing monitor as a brand-new copy.
+async function cloneRow(id) {
+  const res = await fetch(API('/monitors/' + id));
+  const r = await res.json();
+  editingId = null;            // null => saveForm POSTs a new monitor
+  document.getElementById('formTitle').textContent = 'Clone monitor';
+  r.cert_alias = (r.cert_alias || '') + ' (copy)';
+  populateForm(r);
+}
+
+async function saveForm() {
+  const payload = {
+    cert_alias: document.getElementById('f_alias').value,
+    cert_pem: document.getElementById('f_cert').value,
+    issuer_pem: document.getElementById('f_issuer').value,
+    crl_uri: document.getElementById('f_uri').value,
+    uptime_kuma_url: document.getElementById('f_kuma').value,
+    frequency_min: parseInt(document.getElementById('f_freq').value) || 60,
+    enabled: document.getElementById('f_enabled').checked,
+    // null => inherit the global default set; an array => this monitor's own set.
+    tests: document.getElementById('f_tests_inherit').checked
+      ? null : selectedTests('f_tests_box'),
+    // '' => inherit the global default threshold; a number => this monitor's own.
+    response_time_ms: document.getElementById('f_resptime').value === ''
+      ? null : parseInt(document.getElementById('f_resptime').value),
+  };
+  const btn = document.getElementById('saveBtn');
+  btn.disabled = true;
+  try {
+    const url = editingId ? API('/monitors/' + editingId) : API('/monitors');
+    const method = editingId ? 'PUT' : 'POST';
+    const res = await mutate(url, method, payload);
+    if (!res.ok) {
+      const err = await res.json();
+      document.getElementById('formErrors').textContent =
+        (err.errors || [err.message || 'Save failed']).join('\n');
+      return;
+    }
+    closeForm(); flash('Saved.'); load();
+  } catch (e) {
+    document.getElementById('formErrors').textContent = e.message;
+  } finally { btn.disabled = false; }
+}
+
+async function delRow(id) {
+  const alias = aliasFor(id);
+  if (!confirm('Delete "' + alias + '"?')) return;
+  const res = await mutate(API('/monitors/' + id), 'DELETE');
+  flash(res.ok ? 'Deleted.' : 'Delete failed.'); load();
+}
+
+async function checkNow(id) {
+  flash('Checking…');
+  try {
+    const res = await mutate(API('/monitors/' + id + '/check'), 'POST');
+    flash(res.ok ? 'Check complete.' : (res.status === 429 ? 'Rate limited — slow down.' : 'Check failed.'));
+    load();
+  } catch (e) { flash('Check failed: ' + e.message); }
+}
+
+async function toggleEnabled(id, currentlyEnabled) {
+  const action = currentlyEnabled ? 'disable' : 'enable';
+  const res = await mutate(API('/monitors/' + id + '/' + action), 'POST');
+  flash(res.ok ? (currentlyEnabled ? 'Disabled.' : 'Enabled.') : 'Action failed.');
+  load();
+}
+
+async function showHist(id) {
+  const alias = aliasFor(id);
+  document.getElementById('histTitle').textContent = 'History — ' + alias;
+  const body = document.getElementById('histBody');
+  body.innerHTML = '<span class="muted">Loading…</span>';
+  document.getElementById('histOverlay').classList.add('open');
+  const res = await fetch(API('/monitors/' + id + '/history?limit=100'));
+  const data = await res.json();
+  if (!data.length) { body.innerHTML = '<span class="muted">No status changes recorded yet.</span>'; return; }
+  body.innerHTML = data.map(h =>
+    `<div class="hist-row">
+       <span><span class="badge ${h.status}">${h.status}</span> ${esc(h.message)}</span>
+       <span class="muted">${fmt(h.timestamp)}</span>
+     </div>`).join('');
+}
+function closeHist() { document.getElementById('histOverlay').classList.remove('open'); }
+
+async function openSettings() {
+  const res = await fetch(API('/settings'));
+  const s = await res.json();
+  document.getElementById('s_debug').checked = !!s.debug_logging;
+  document.getElementById('s_failures').checked = !!s.log_only_failures;
+  document.getElementById('s_kuma').checked = !!s.uptime_kuma_logging;
+  globalDefaultTests = s.default_tests || [];
+  renderTestChecks('s_tests_box', 's_t_', globalDefaultTests);
+  document.getElementById('s_resptime').value = s.default_response_time_ms || '';
+  document.getElementById('settingsOverlay').classList.add('open');
+}
+function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
+async function saveSettings() {
+  await mutate(API('/settings'), 'PUT', {
+    debug_logging: document.getElementById('s_debug').checked,
+    log_only_failures: document.getElementById('s_failures').checked,
+    uptime_kuma_logging: document.getElementById('s_kuma').checked,
+    default_tests: selectedTests('s_tests_box'),
+    default_response_time_ms: parseInt(document.getElementById('s_resptime').value) || 5000,
+  });
+  globalDefaultTests = selectedTests('s_tests_box');
+  closeSettings(); flash('Settings saved.');
+}
+
+// ---- Reports ----
+let reportTab = 'uptime';
+let repMonitors = [];
+
+function pad(n) { return String(n).padStart(2, '0'); }
+function toLocalInput(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function fmtDur(s) {
+  s = Math.round(s || 0);
+  const d = Math.floor(s/86400); s %= 86400;
+  const h = Math.floor(s/3600); s %= 3600;
+  const m = Math.floor(s/60);
+  const parts = [];
+  if (d) parts.push(d + 'd');
+  if (h) parts.push(h + 'h');
+  if (m || (!d && !h)) parts.push(m + 'm');
+  return parts.join(' ');
+}
+
+function applyQuickRange() {
+  const h = parseInt(document.getElementById('rep_quick').value);
+  if (!h) return;
+  document.getElementById('rep_to').value = toLocalInput(new Date());
+  document.getElementById('rep_from').value = toLocalInput(new Date(Date.now() - h*3600*1000));
+}
+
+async function openReports() {
+  repMonitors = await (await fetch(API('/monitors'))).json();
+  document.getElementById('rep_monitors').innerHTML = repMonitors.length
+    ? repMonitors.map(m => `<div class="check"><input type="checkbox" class="rep-mon" value="${m.id}" id="rm_${m.id}"><label for="rm_${m.id}" style="margin:0">${esc(m.cert_alias)}</label></div>`).join('')
+    : '<span class="muted">No monitors configured.</span>';
+  document.getElementById('rep_quick').value = '168';
+  applyQuickRange();
+  setReportTab('uptime');
+  document.getElementById('reportsOverlay').classList.add('open');
+}
+function closeReports() { document.getElementById('reportsOverlay').classList.remove('open'); }
+
+function selectedMonitorIds() {
+  return [...document.querySelectorAll('.rep-mon:checked')].map(c => c.value).join(',');
+}
+function repParams() {
+  const p = new URLSearchParams();
+  const f = document.getElementById('rep_from').value, t = document.getElementById('rep_to').value;
+  if (f) p.set('from', new Date(f).toISOString());
+  if (t) p.set('to', new Date(t).toISOString());
+  const ids = selectedMonitorIds(); if (ids) p.set('monitor_ids', ids);
+  p.set('down_mode', document.getElementById('rep_down').value);
+  p.set('disabled_mode', document.getElementById('rep_disabled').value);
+  p.set('exclude_maintenance', document.getElementById('rep_maint').checked ? 'true' : 'false');
+  return p;
+}
+
+function setReportTab(tab) {
+  reportTab = tab;
+  ['uptime', 'downtimes', 'maint'].forEach(t =>
+    document.getElementById('rep_tab_' + t).classList.toggle('active', t === tab));
+  runReport();
+}
+
+async function runReport() {
+  const body = document.getElementById('rep_body');
+  body.innerHTML = '<span class="muted">Loading…</span>';
+  try {
+    if (reportTab === 'maint') return renderMaint();
+    const path = reportTab === 'uptime' ? '/reports/uptime' : '/reports/downtimes';
+    const res = await fetch(API(path) + '?' + repParams().toString());
+    const data = await res.json();
+    if (!res.ok) { body.innerHTML = esc(data.message || 'Report failed.'); return; }
+    reportTab === 'uptime' ? renderUptime(data) : renderDowntimes(data);
+  } catch (e) { body.innerHTML = esc(e.message); }
+}
+
+function downtimeRow(d, showMonitor) {
+  const tag = d.excluded ? ' <span class="excluded-tag">(maintenance/disabled — excluded)</span>' : '';
+  const mon = showMonitor ? `<b>${esc(d.cert_alias)}</b> · ` : '';
+  return `<div class="dt-row">
+    <span class="small">${fmt(d.start)}</span>
+    <span class="small">${fmtDur(d.duration_s)}</span>
+    <span><span class="badge ${d.status}">${d.status}</span> ${mon}${esc(d.reason || '')}${tag}
+      <div class="dt-comment">
+        <input type="text" id="cmt_${d.hist_id}" placeholder="Add a comment…" value="${esc(d.comment || '')}">
+        <button class="secondary tiny" onclick="saveComment(${d.hist_id})">Save</button>
+      </div>
+    </span></div>`;
+}
+
+function renderUptime(data) {
+  const body = document.getElementById('rep_body');
+  if (!data.monitors.length) { body.innerHTML = '<span class="muted">No monitors selected.</span>'; return; }
+  body.innerHTML = data.monitors.map(r => {
+    const pct = r.uptime_pct == null ? 'n/a' : r.uptime_pct.toFixed(3) + '%';
+    const w = r.uptime_pct == null ? 0 : r.uptime_pct;
+    const dts = r.downtimes.length
+      ? `<div class="dt-row head"><span>Started</span><span>Duration</span><span>Reason / comment</span></div>`
+        + r.downtimes.map(d => downtimeRow(d, false)).join('')
+      : '<div class="muted small" style="margin-top:6px">No downtimes in range.</div>';
+    return `<div class="uptime-card">
+      <div class="uptime-head"><b>${esc(r.cert_alias)}</b><span class="uptime-pct">${pct}</span></div>
+      <div class="bar"><span style="width:${w}%"></span></div>
+      <div class="muted small">up ${fmtDur(r.up_seconds)} · down ${fmtDur(r.down_seconds)} · maintenance ${fmtDur(r.maintenance_seconds)} · disabled ${fmtDur(r.disabled_seconds)} · no-data ${fmtDur(r.nodata_seconds)}</div>
+      ${dts}</div>`;
+  }).join('');
+}
+
+function renderDowntimes(data) {
+  const body = document.getElementById('rep_body');
+  if (!data.downtimes.length) { body.innerHTML = '<span class="muted">No downtimes in range.</span>'; return; }
+  body.innerHTML = `<div class="dt-row head"><span>Started</span><span>Duration</span><span>Monitor / reason / comment</span></div>`
+    + data.downtimes.map(d => downtimeRow(d, true)).join('');
+}
+
+async function saveComment(hid) {
+  const val = document.getElementById('cmt_' + hid).value;
+  const res = await mutate(API('/history/' + hid), 'PUT', { comment: val });
+  flash(res.ok ? 'Comment saved.' : 'Save failed.');
+}
+
+async function renderMaint() {
+  const body = document.getElementById('rep_body');
+  body.innerHTML = '<span class="muted">Loading…</span>';
+  const rows = await (await fetch(API('/maintenance'))).json();
+  const monOpts = '<option value="">All monitors</option>'
+    + repMonitors.map(m => `<option value="${m.id}">${esc(m.cert_alias)}</option>`).join('');
+  const add = `<div class="uptime-card"><b>Add maintenance window</b>
+    <div class="rep-controls" style="margin-top:8px">
+      <div><label style="margin:0 0 4px">Monitor</label><select id="mw_mon">${monOpts}</select></div>
+      <div><label style="margin:0 0 4px">Start</label><input type="datetime-local" id="mw_start"></div>
+      <div><label style="margin:0 0 4px">End</label><input type="datetime-local" id="mw_end"></div>
+      <div style="flex:1;min-width:140px"><label style="margin:0 0 4px">Comment</label><input type="text" id="mw_comment" placeholder="reason"></div>
+      <div><button onclick="addMaint()">Add</button></div>
+    </div></div>`;
+  const list = rows.length ? rows.map(w => {
+    const who = w.monitor_id == null ? 'All monitors'
+      : ((repMonitors.find(m => m.id === w.monitor_id) || {}).cert_alias || ('#' + w.monitor_id));
+    return `<div class="maint-row"><span><b>${esc(who)}</b> · ${fmt(w.start_ts)} → ${fmt(w.end_ts)}${w.comment ? ' · ' + esc(w.comment) : ''}</span>
+      <button class="danger tiny" onclick="delMaint(${w.id})">Delete</button></div>`;
+  }).join('') : '<div class="muted small" style="margin-top:8px">No maintenance windows defined.</div>';
+  body.innerHTML = add + list;
+}
+
+async function addMaint() {
+  const s = document.getElementById('mw_start').value, e = document.getElementById('mw_end').value;
+  if (!s || !e) { flash('Start and end are required.'); return; }
+  const payload = { start: new Date(s).toISOString(), end: new Date(e).toISOString(),
+                    comment: document.getElementById('mw_comment').value };
+  const mon = document.getElementById('mw_mon').value;
+  if (mon) payload.monitor_id = parseInt(mon);
+  const res = await mutate(API('/maintenance'), 'POST', payload);
+  if (res.ok) { flash('Maintenance window added.'); renderMaint(); }
+  else { const er = await res.json().catch(() => ({})); flash(er.message || 'Add failed.'); }
+}
+async function delMaint(id) {
+  if (!confirm('Delete this maintenance window?')) return;
+  const res = await mutate(API('/maintenance/' + id), 'DELETE');
+  flash(res.ok ? 'Deleted.' : 'Delete failed.'); renderMaint();
+}
+
+// Close modals on overlay click.
+document.querySelectorAll('.overlay').forEach(o =>
+  o.addEventListener('click', e => { if (e.target === o) o.classList.remove('open'); }));
+
+async function init() {
+  await loadTests();
+  // Preload the global default so the Add form shows it before Settings is opened.
+  try { globalDefaultTests = (await (await fetch(API('/settings'))).json()).default_tests || []; }
+  catch (e) { globalDefaultTests = []; }
+  load();
+}
+init();
+setInterval(load, 15000);  // poll for live status
+</script>
+</body>
+</html>
