@@ -285,6 +285,8 @@ CREATE TABLE IF NOT EXISTS crl_snapshots (
     this_update  TEXT,
     next_update  TEXT,
     crl_number   TEXT,
+    crl_issuer   TEXT,
+    revoked_count INTEGER,
     response_ms  INTEGER,
     FOREIGN KEY (monitor_id) REFERENCES monitors(id) ON DELETE CASCADE
 );
@@ -360,6 +362,16 @@ def _migrate(db):
          "ALTER TABLE monitors ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"),
     ):
         if col not in have:
+            db.execute(ddl)
+
+    # crl_snapshots gained issuer/revoked-count columns for the CRL history.
+    snap_have = {r["name"]
+                 for r in db.execute("PRAGMA table_info(crl_snapshots)").fetchall()}
+    for col, ddl in (
+        ("crl_issuer", "ALTER TABLE crl_snapshots ADD COLUMN crl_issuer TEXT"),
+        ("revoked_count", "ALTER TABLE crl_snapshots ADD COLUMN revoked_count INTEGER"),
+    ):
+        if col not in snap_have:
             db.execute(ddl)
 
 
@@ -516,7 +528,7 @@ def _pinned_request(method, url, hostname, pinned_ip, **kwargs):
 class CRLResult:
     def __init__(self, status, message, response_ms=None,
                  this_update=None, next_update=None, checks=None,
-                 crl_number=None):
+                 crl_number=None, crl_issuer=None, revoked_count=None):
         self.status = status            # Valid | Revoked | Error | Unknown
         self.message = message
         self.response_ms = response_ms
@@ -525,6 +537,10 @@ class CRLResult:
         # The CRL Number (int) observed this run, or None when absent/unparsed.
         # Carried out so the worker can persist it for rollback detection.
         self.crl_number = crl_number
+        # The issuing CA (CRL issuer distinguished name) and the count of
+        # revoked certificates in the CRL, captured for the CRL history.
+        self.crl_issuer = crl_issuer
+        self.revoked_count = revoked_count
         # Per-test outcomes: list of {key, label, status, message} where status
         # is one of pass | fail | skip.
         self.checks = checks or []
@@ -572,6 +588,27 @@ def _crl_number(crl):
         return None
     except Exception:
         return None
+
+
+def _crl_issuer(crl):
+    """Return the CRL issuer (issuing CA) distinguished name as an RFC 4514
+    string, or None when it cannot be read."""
+    try:
+        return crl.issuer.rfc4514_string()
+    except Exception:
+        return None
+
+
+def _revoked_count(crl):
+    """Return the number of revoked certificates listed in the CRL, or None
+    when the count cannot be determined."""
+    try:
+        return len(crl)
+    except Exception:
+        try:
+            return sum(1 for _ in crl)
+        except Exception:
+            return None
 
 
 def _revocation_reason(revoked_entry):
@@ -979,7 +1016,7 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
                            "status": "pass" if ok else "fail", "message": message})
 
     def finish(response_ms=None, this_update=None, next_update=None, revoked=False,
-               crl_number=None):
+               crl_number=None, crl_issuer=None, revoked_count=None):
         # Any selected test we never reached couldn't run -> skip.
         done = {c["key"] for c in checks}
         for k in enabled:
@@ -993,6 +1030,7 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
             _compose_message(checks, enabled),
             response_ms=response_ms, this_update=this_update,
             next_update=next_update, checks=checks, crl_number=crl_number,
+            crl_issuer=crl_issuer, revoked_count=revoked_count,
         )
 
     start = time.monotonic()
@@ -1075,6 +1113,8 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
 
     this_update, next_update = _crl_update_window(crl)
     crl_number = _crl_number(crl)
+    crl_issuer = _crl_issuer(crl)
+    revoked_count = _revoked_count(crl)
 
     # Delta CRL support is opt-in: only fetch the delta when the test is enabled.
     delta_crl, delta_eval = None, None
@@ -1092,7 +1132,8 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
 
     return finish(response_ms=elapsed_ms, this_update=_fmt(this_update),
                   next_update=_fmt(next_update), revoked=revoked,
-                  crl_number=crl_number)
+                  crl_number=crl_number, crl_issuer=crl_issuer,
+                  revoked_count=revoked_count)
 
 
 # --------------------------------------------------------------------------- #
@@ -1238,9 +1279,11 @@ def _record_crl_snapshot(db, rid, now, result):
     forever)."""
     db.execute(
         "INSERT INTO crl_snapshots (monitor_id, captured_at, status, this_update, "
-        "next_update, crl_number, response_ms) VALUES (?,?,?,?,?,?,?)",
+        "next_update, crl_number, crl_issuer, revoked_count, response_ms) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         (rid, now.isoformat(), result.status, result.this_update, result.next_update,
          str(result.crl_number) if result.crl_number is not None else None,
+         result.crl_issuer, result.revoked_count,
          result.response_ms),
     )
     try:
@@ -2046,11 +2089,20 @@ def monitor_crl_data(rid):
     limit = min(int(request.args.get("limit", 200)), 1000)
     rows = db.execute(
         "SELECT captured_at, status, this_update, next_update, crl_number, "
-        "response_ms FROM crl_snapshots WHERE monitor_id=? "
-        "ORDER BY captured_at DESC LIMIT ?",
+        "crl_issuer, revoked_count, response_ms FROM crl_snapshots "
+        "WHERE monitor_id=? ORDER BY captured_at DESC LIMIT ?",
         (rid, limit),
     ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    out = []
+    for r in rows:
+        d = dict(r)
+        # Time remaining the CRL had when this snapshot was captured, i.e.
+        # nextUpdate minus the capture time, expressed in whole seconds.
+        nu, cap = _parse_ts(d.get("next_update")), _parse_ts(d.get("captured_at"))
+        d["time_remaining_sec"] = (
+            int((nu - cap).total_seconds()) if nu and cap else None)
+        out.append(d)
+    return jsonify(out)
 
 
 # ---- Downtime comments ---- #

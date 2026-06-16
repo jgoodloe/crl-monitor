@@ -492,7 +492,9 @@ def test_check_monitor_records_crl_snapshot(m, monkeypatch):
         )
         rid = cur.lastrowid
         db.commit()
-        _stub_download(m, monkeypatch, _make_crl(ca_key, ca, crl_number=3))
+        _stub_download(m, monkeypatch,
+                       _make_crl(ca_key, ca, crl_number=3,
+                                 revoked_serials=[111, 222]))
         row = db.execute("SELECT * FROM monitors WHERE id=?", (rid,)).fetchone()
         m.check_monitor(db, row)
         snaps = db.execute("SELECT * FROM crl_snapshots WHERE monitor_id=?",
@@ -500,6 +502,22 @@ def test_check_monitor_records_crl_snapshot(m, monkeypatch):
         assert len(snaps) == 1
         assert snaps[0]["status"] == "Valid"
         assert snaps[0]["next_update"] is not None
+        # CRL history captures the issuing CA, CRL number, and revoked count.
+        assert snaps[0]["crl_number"] == "3"
+        assert "Test CA" in (snaps[0]["crl_issuer"] or "")
+        assert snaps[0]["revoked_count"] == 2
+
+
+def test_run_crl_check_captures_issuer_and_revoked_count(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    crl = _make_crl(ca_key, ca, revoked_serials=[1, 2, 3], crl_number=9)
+    _stub_download(m, monkeypatch, crl)
+
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl", DEFAULTS)
+    assert res.revoked_count == 3
+    assert res.crl_number == 9
+    assert res.crl_issuer and "CN=" in res.crl_issuer
 
 
 def test_freshest_crl_urls_extraction(m):

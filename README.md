@@ -80,11 +80,14 @@ global.
 
 ### CRL data retention
 
-On every check the monitor captures a snapshot of the CRL's metadata
-(`thisUpdate`, `nextUpdate`, CRL number, status, response time). Snapshots are
-retained for a configurable number of days (**Settings → Keep CRL data for**;
-`0` keeps them indefinitely) and are viewable per monitor via the **CRL Data**
-button or the `GET /api/monitors/<id>/crl-data` endpoint.
+On every check the monitor captures a snapshot of the CRL's metadata: the
+issuing **CA** (CRL issuer DN), **CRL number**, **number of revoked
+certificates**, **time remaining** until expiry (`nextUpdate` minus the capture
+time, returned as `time_remaining_sec`), **nextUpdate**, plus `thisUpdate`,
+status, and response time. Snapshots are retained for a configurable number of
+days (**Settings → Keep CRL data for**; `0` keeps them indefinitely) and are
+viewable per monitor via the **CRL Data** button or the
+`GET /api/monitors/<id>/crl-data` endpoint.
 
 ## Configuration (environment variables)
 

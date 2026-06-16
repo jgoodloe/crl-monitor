@@ -448,6 +448,27 @@ function fmt(dt) {
   const d = new Date(dt);
   return isNaN(d) ? dt : d.toLocaleString();
 }
+// A CRL issuer DN can be long; show its CN (or first RDN) for compactness.
+function crlIssuerCN(dn) {
+  if (!dn) return '—';
+  const m = dn.match(/CN=([^,]+)/i);
+  return esc(m ? m[1].trim() : dn.split(',')[0].trim());
+}
+// Human-readable "time remaining" from a whole-second count (may be negative
+// when the CRL had already expired at capture time).
+function fmtRemaining(sec) {
+  if (sec == null) return '—';
+  const past = sec < 0;
+  let s = Math.abs(sec);
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const h = Math.floor(s / 3600);  s -= h * 3600;
+  const m = Math.floor(s / 60);
+  let out;
+  if (d > 0)      out = d + 'd ' + h + 'h';
+  else if (h > 0) out = h + 'h ' + m + 'm';
+  else            out = m + 'm';
+  return past ? '-' + out : out;
+}
 function flash(msg) {
   const el = document.getElementById('globalMsg');
   el.textContent = msg;
@@ -648,7 +669,10 @@ async function showCrlData(id) {
     `<div class="hist-row">
        <span><span class="badge ${d.status}">${d.status}</span>
          #${esc(d.crl_number || '—')} ·
+         CA ${esc(crlIssuerCN(d.crl_issuer))} ·
+         ${d.revoked_count != null ? d.revoked_count + ' revoked' : '— revoked'} ·
          next ${fmt(d.next_update)} ·
+         ${fmtRemaining(d.time_remaining_sec)} left ·
          ${d.response_ms != null ? d.response_ms + ' ms' : '—'}</span>
        <span class="muted">${fmt(d.captured_at)}</span>
      </div>`).join('');
