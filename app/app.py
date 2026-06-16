@@ -250,6 +250,10 @@ DEFAULT_SETTINGS = {
     # Global default response-time threshold (ms) for the response_time test,
     # used by any monitor that doesn't set its own.
     "default_response_time_ms": str(DEFAULT_RESPONSE_TIME_MS),
+    # Maximum accepted CRL download size (bytes). Configurable at runtime so an
+    # operator can raise it for large CRLs (e.g. some US-government CAs publish
+    # CRLs of tens of MiB). Defaults to the MAX_CRL_BYTES env value.
+    "max_crl_bytes": str(MAX_CRL_BYTES),
 }
 
 
@@ -648,7 +652,7 @@ def _download_crl(url, timeout, max_bytes):
 
 
 def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
-                  timeout=CRL_TIMEOUT, threshold_ms=0):
+                  timeout=CRL_TIMEOUT, threshold_ms=0, max_bytes=MAX_CRL_BYTES):
     """Resolve a CRL distribution point, download the CRL, parse it, and
     evaluate the selected verification tests.
 
@@ -656,7 +660,8 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
     `enabled_tests` (see ALL_TEST_KEYS). The foundational steps form a
     dependency chain; when one fails the check cannot continue and the dependent
     tests are skipped. A failed foundational step only fails the overall status
-    when that step is selected. `threshold_ms` is the response-time limit.
+    when that step is selected. `threshold_ms` is the response-time limit and
+    `max_bytes` caps the CRL download size.
     """
     enabled = [k for k in ALL_TEST_KEYS if k in (enabled_tests or [])]
     enabled_set = set(enabled)
@@ -719,7 +724,7 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
     chosen = None  # (url, status, content, too_large)
     for url in candidates:
         try:
-            status, content, too_large = _download_crl(url, timeout, MAX_CRL_BYTES)
+            status, content, too_large = _download_crl(url, timeout, max_bytes)
         except UnsafeURLError as e:
             log.warning("[CRL] blocked outbound URL %r: %s", url, e)
             continue
@@ -749,7 +754,7 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
     # 4. Parse the CRL (DER, then PEM).
     if too_large:
         record("crl_parse", False,
-               f"CRL exceeds the maximum download size ({MAX_CRL_BYTES} bytes).")
+               f"CRL exceeds the maximum download size ({max_bytes} bytes).")
         return finish(response_ms=elapsed_ms)
     try:
         crl = _load_crl(content)
@@ -830,6 +835,16 @@ def resolve_threshold_ms(db, row):
         return DEFAULT_RESPONSE_TIME_MS
 
 
+def resolve_max_crl_bytes(db):
+    """The maximum CRL download size (bytes): the configured `max_crl_bytes`
+    setting, falling back to the MAX_CRL_BYTES default when unset or invalid."""
+    try:
+        n = int(get_setting(db, "max_crl_bytes", str(MAX_CRL_BYTES)))
+        return n if n > 0 else MAX_CRL_BYTES
+    except (TypeError, ValueError):
+        return MAX_CRL_BYTES
+
+
 def check_monitor(db, row):
     rid = row["id"]
     alias = row["cert_alias"]
@@ -839,14 +854,15 @@ def check_monitor(db, row):
 
     enabled_tests = resolve_tests(db, row)
     threshold_ms = resolve_threshold_ms(db, row)
+    max_bytes = resolve_max_crl_bytes(db)
     if debug:
-        log.info("[Worker] checking '%s' (id=%s) uri=%s tests=%s threshold=%sms",
+        log.info("[Worker] checking '%s' (id=%s) uri=%s tests=%s threshold=%sms max_bytes=%s",
                  alias, rid, row["crl_uri"], ",".join(enabled_tests) or "none",
-                 threshold_ms)
+                 threshold_ms, max_bytes)
 
     result = run_crl_check(
         row["cert_pem"], row["issuer_pem"], row["crl_uri"], enabled_tests,
-        threshold_ms=threshold_ms,
+        threshold_ms=threshold_ms, max_bytes=max_bytes,
     )
 
     now = datetime.now(timezone.utc)
@@ -1689,6 +1705,9 @@ def put_settings():
             sv = ",".join(parse_tests(v) or [])
         elif k == "default_response_time_ms":
             sv = str(_int_or_none(v) or DEFAULT_RESPONSE_TIME_MS)
+        elif k == "max_crl_bytes":
+            n = _int_or_none(v)
+            sv = str(n if (n and n > 0) else MAX_CRL_BYTES)
         elif v is True:
             sv = "true"
         elif v is False:

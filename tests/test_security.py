@@ -211,6 +211,37 @@ def test_push_url_visible_in_detail_masked_in_list(m):
     assert "SECRETTOKEN" not in listed["uptime_kuma_url"]  # masked in bulk list
 
 
+def test_max_crl_bytes_setting_round_trips(m):
+    """The CRL download cap is a runtime setting: exposed, updatable, and
+    non-positive/garbage values fall back to the MAX_CRL_BYTES default."""
+    client = m.app.test_client()
+
+    assert "max_crl_bytes" in client.get("/api/settings").get_json()
+
+    r = client.put("/api/settings", json={"max_crl_bytes": 50 * 1024 * 1024},
+                   headers=_csrf())
+    assert r.status_code == 200
+    assert int(r.get_json()["max_crl_bytes"]) == 50 * 1024 * 1024
+
+    # 0 / invalid -> default, never an unusable cap.
+    r = client.put("/api/settings", json={"max_crl_bytes": 0}, headers=_csrf())
+    assert int(r.get_json()["max_crl_bytes"]) == m.MAX_CRL_BYTES
+
+
+def test_resolve_max_crl_bytes_reads_setting(m):
+    from contextlib import closing
+    with closing(m.raw_db()) as db:
+        db.execute(
+            "INSERT INTO settings (key, value) VALUES ('max_crl_bytes', '987654') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        db.commit()
+        assert m.resolve_max_crl_bytes(db) == 987654
+        db.execute("UPDATE settings SET value='nonsense' WHERE key='max_crl_bytes'")
+        db.commit()
+        assert m.resolve_max_crl_bytes(db) == m.MAX_CRL_BYTES
+
+
 def test_update_push_url_is_authoritative(m):
     client = m.app.test_client()
     url = "https://status.example.com/api/push/TOK1"

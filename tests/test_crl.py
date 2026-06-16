@@ -183,6 +183,21 @@ def test_no_crl_url_available(m, monkeypatch):
     assert url["status"] == "fail"
 
 
+def test_too_large_crl_reports_configured_limit(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    crl = _make_crl(ca_key, ca, revoked_serials=[])
+    _stub_download(m, monkeypatch, crl, too_large=True)
+
+    # The configured max_bytes flows through to the failure message.
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+                          DEFAULTS, max_bytes=12345)
+    assert res.status == "Error"
+    parse = next(c for c in res.checks if c["key"] == "crl_parse")
+    assert parse["status"] == "fail"
+    assert "12345" in parse["message"]
+
+
 def test_deselecting_cert_status_keeps_revoked_off_status(m, monkeypatch):
     ca_key, ca = _make_ca()
     leaf = _make_leaf(ca_key, ca, serial=999)

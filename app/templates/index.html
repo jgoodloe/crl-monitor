@@ -225,6 +225,12 @@
     <div id="s_tests_box" class="tests-box"></div>
     <label style="margin-top:16px">Default response-time threshold (ms)</label>
     <input type="number" id="s_resptime" min="1" placeholder="5000">
+    <label style="margin-top:16px">Maximum CRL download size (MiB)</label>
+    <div class="muted small" style="margin-bottom:6px">
+      CRLs larger than this are rejected. Raise it for large CRLs (some
+      US-government CAs publish CRLs of tens of MiB).
+    </div>
+    <input type="number" id="s_maxcrl" min="1" step="1" placeholder="16">
     <div class="modal-actions">
       <button class="secondary" onclick="closeSettings()">Cancel</button>
       <button onclick="saveSettings()">Save</button>
@@ -562,6 +568,8 @@ async function openSettings() {
   globalDefaultTests = s.default_tests || [];
   renderTestChecks('s_tests_box', 's_t_', globalDefaultTests);
   document.getElementById('s_resptime').value = s.default_response_time_ms || '';
+  const maxBytes = parseInt(s.max_crl_bytes) || (16 * 1024 * 1024);
+  document.getElementById('s_maxcrl').value = Math.round(maxBytes / (1024 * 1024));
   document.getElementById('settingsOverlay').classList.add('open');
 }
 function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
@@ -572,6 +580,7 @@ async function saveSettings() {
     uptime_kuma_logging: document.getElementById('s_kuma').checked,
     default_tests: selectedTests('s_tests_box'),
     default_response_time_ms: parseInt(document.getElementById('s_resptime').value) || 5000,
+    max_crl_bytes: (parseInt(document.getElementById('s_maxcrl').value) || 16) * 1024 * 1024,
   });
   globalDefaultTests = selectedTests('s_tests_box');
   closeSettings(); flash('Settings saved.');

@@ -58,7 +58,7 @@ certs from the same CA / CRL).
 | `URL_PREFIX` | *(empty)* | Subpath to mount under, e.g. `/crl`. Leave empty for root or a dedicated (sub)domain. |
 | `SCHEDULER_INTERVAL` | `30` | How often (seconds) the scheduler looks for due checks. |
 | `CRL_TIMEOUT` | `30` | Per-request CRL HTTP timeout (seconds). |
-| `MAX_CRL_BYTES` | `16777216` | Maximum CRL download size (bytes). Larger CRLs are rejected. |
+| `MAX_CRL_BYTES` | `16777216` | Default maximum CRL download size (bytes). Larger CRLs are rejected. Overridable at runtime in **Settings** (e.g. raise it for large US-government CRLs). |
 | `HISTORY_LIMIT` | `200` | Status-history rows retained per monitor. |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
 | `DATA_DIR` | `/data` | Where the SQLite DB is stored (mount a volume here). |
@@ -85,8 +85,9 @@ blast radius but does not replace access control.
   set `CRL_BLOCK_PRIVATE=false` — internal-PKI users fetching CRLs from private
   hosts should instead allowlist them via `CRL_ALLOWED_HOSTS` (hostnames, IPs, or
   CIDRs). Connections are pinned to the validated IP to limit DNS rebinding.
-- **Download cap.** CRL downloads are capped at `MAX_CRL_BYTES` (streamed) so a
-  hostile or oversized endpoint can't exhaust memory.
+- **Download cap.** CRL downloads are capped at the configured maximum size
+  (streamed) so a hostile or oversized endpoint can't exhaust memory. The cap
+  defaults to `MAX_CRL_BYTES` and can be adjusted at runtime in **Settings**.
 - **CSRF.** State-changing API requests require an `X-Requested-With` header and
   a JSON content type, which browsers can't send cross-origin without a CORS
   preflight the app never grants.
