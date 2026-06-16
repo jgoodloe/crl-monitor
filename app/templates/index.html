@@ -99,6 +99,11 @@
   .pill.fail { background: rgba(239,68,68,.12); color: var(--bad); border-color: rgba(239,68,68,.3); }
   .pill.skip { background: rgba(100,116,139,.15); color: var(--muted); }
   .modal.wide { max-width: 880px; }
+  /* Wide enough for the longest CRL data line (incl. ~15 extra chars of CA
+     name) to stay on a single row; body scrolls horizontally if narrower. */
+  .modal.crl-wide { max-width: 1180px; }
+  #crlDataBody { overflow-x: auto; }
+  .crl-row > span:first-child { white-space: nowrap; }
   .rep-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
   .rep-controls > div { display: flex; flex-direction: column; }
   .rep-controls input[type=datetime-local], .rep-controls select { width: auto; }
@@ -233,7 +238,7 @@
 
 <!-- CRL data modal -->
 <div class="overlay" id="crlDataOverlay">
-  <div class="modal">
+  <div class="modal crl-wide">
     <h2 id="crlDataTitle">CRL data</h2>
     <div id="crlDataBody" class="small"></div>
     <div class="modal-actions">
