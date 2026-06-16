@@ -69,7 +69,8 @@ def _make_leaf(ca_key, ca_cert, cn="leaf", serial=None):
 
 
 def _make_crl(ca_key, ca_cert, revoked_serials=(),
-              last_days=-1, next_days=7, crl_number=None, idp=None, sig_hash=None):
+              last_days=-1, next_days=7, crl_number=None, idp=None, sig_hash=None,
+              revoked_reason=None, freshest=None, delta_indicator=None):
     now = datetime.now(timezone.utc)
     builder = (
         x509.CertificateRevocationListBuilder()
@@ -81,14 +82,22 @@ def _make_crl(ca_key, ca_cert, revoked_serials=(),
         builder = builder.add_extension(x509.CRLNumber(crl_number), critical=False)
     if idp is not None:
         builder = builder.add_extension(idp, critical=False)
+    if freshest is not None:
+        builder = builder.add_extension(
+            x509.FreshestCRL([x509.DistributionPoint(
+                full_name=[x509.UniformResourceIdentifier(freshest)],
+                relative_name=None, reasons=None, crl_issuer=None)]),
+            critical=False)
+    if delta_indicator is not None:
+        builder = builder.add_extension(
+            x509.DeltaCRLIndicator(delta_indicator), critical=True)
     for s in revoked_serials:
-        rc = (
-            x509.RevokedCertificateBuilder()
-            .serial_number(s)
-            .revocation_date(now - timedelta(days=1))
-            .build()
-        )
-        builder = builder.add_revoked_certificate(rc)
+        rc = (x509.RevokedCertificateBuilder()
+              .serial_number(s)
+              .revocation_date(now - timedelta(days=1)))
+        if revoked_reason is not None:
+            rc = rc.add_extension(x509.CRLReason(revoked_reason), critical=False)
+        builder = builder.add_revoked_certificate(rc.build())
     return builder.sign(ca_key, sig_hash or hashes.SHA256())
 
 
@@ -406,6 +415,133 @@ def test_idp_dp_name_match_passes_mismatch_fails(m, monkeypatch):
     assert res.status == "Error"
     idp = next(c for c in res.checks if c["key"] == "idp")
     assert idp["status"] == "fail"
+
+
+def test_revocation_reason_surfaced(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca, serial=4242)
+    crl = _make_crl(ca_key, ca, revoked_serials=[4242],
+                    revoked_reason=x509.ReasonFlags.key_compromise)
+    _stub_download(m, monkeypatch, crl)
+
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl", DEFAULTS)
+    assert res.status == "Revoked", res.message
+    cs = next(c for c in res.checks if c["key"] == "cert_status")
+    assert "keyCompromise" in cs["message"]
+
+
+def test_retry_compute_fixed_and_backoff(m):
+    now = datetime.now(timezone.utc)
+    fixed = m._compute_retry_run(now, 3, 5, False, 120)
+    assert abs((fixed - (now + timedelta(minutes=5))).total_seconds()) < 1
+    # backoff: 5 * 2^(3-1) = 20
+    bo = m._compute_retry_run(now, 3, 5, True, 120)
+    assert abs((bo - (now + timedelta(minutes=20))).total_seconds()) < 1
+    # backoff capped at retry_max_min
+    capped = m._compute_retry_run(now, 10, 5, True, 30)
+    assert abs((capped - (now + timedelta(minutes=30))).total_seconds()) < 1
+
+
+def test_check_monitor_retry_on_failure_then_reset(m, monkeypatch):
+    import requests
+    from contextlib import closing
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    with closing(m.raw_db()) as db:
+        ts = m.now_iso()
+        cur = db.execute(
+            "INSERT INTO monitors (cert_alias, cert_pem, issuer_pem, crl_uri, tests, "
+            "frequency_min, retry_min, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("retry", _pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+             ",".join(DEFAULTS), 600, 7, ts, ts),
+        )
+        rid = cur.lastrowid
+        db.commit()
+
+        _stub_download(m, monkeypatch, None,
+                       raise_exc=requests.exceptions.ConnectionError("x"))
+        row = db.execute("SELECT * FROM monitors WHERE id=?", (rid,)).fetchone()
+        assert m.check_monitor(db, row).status == "Error"
+        r = db.execute("SELECT consecutive_failures, next_run, last_run "
+                       "FROM monitors WHERE id=?", (rid,)).fetchone()
+        assert r["consecutive_failures"] == 1
+        gap = (m._parse_ts(r["next_run"]) - m._parse_ts(r["last_run"])).total_seconds() / 60
+        assert 6 <= gap <= 8  # the 7-min retry, not the 600-min frequency
+
+        _stub_download(m, monkeypatch, _make_crl(ca_key, ca))
+        row = db.execute("SELECT * FROM monitors WHERE id=?", (rid,)).fetchone()
+        assert m.check_monitor(db, row).status == "Valid"
+        r = db.execute("SELECT consecutive_failures, next_run, last_run "
+                       "FROM monitors WHERE id=?", (rid,)).fetchone()
+        assert r["consecutive_failures"] == 0
+        gap = (m._parse_ts(r["next_run"]) - m._parse_ts(r["last_run"])).total_seconds() / 60
+        assert gap > 100  # back to the frequency schedule
+
+
+def test_check_monitor_records_crl_snapshot(m, monkeypatch):
+    from contextlib import closing
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    with closing(m.raw_db()) as db:
+        ts = m.now_iso()
+        cur = db.execute(
+            "INSERT INTO monitors (cert_alias, cert_pem, issuer_pem, crl_uri, tests, "
+            "frequency_min, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            ("snap", _pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+             ",".join(DEFAULTS), 60, ts, ts),
+        )
+        rid = cur.lastrowid
+        db.commit()
+        _stub_download(m, monkeypatch, _make_crl(ca_key, ca, crl_number=3))
+        row = db.execute("SELECT * FROM monitors WHERE id=?", (rid,)).fetchone()
+        m.check_monitor(db, row)
+        snaps = db.execute("SELECT * FROM crl_snapshots WHERE monitor_id=?",
+                           (rid,)).fetchall()
+        assert len(snaps) == 1
+        assert snaps[0]["status"] == "Valid"
+        assert snaps[0]["next_update"] is not None
+
+
+def test_freshest_crl_urls_extraction(m):
+    ca_key, ca = _make_ca()
+    base = _make_crl(ca_key, ca, crl_number=10, freshest="http://crl.test/delta.crl")
+    assert m._freshest_crl_urls(base) == ["http://crl.test/delta.crl"]
+
+
+def test_delta_crl_applied_detects_revocation(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca, serial=7777)
+    base = _make_crl(ca_key, ca, crl_number=10, freshest="http://crl.test/delta.crl")
+    delta = _make_crl(ca_key, ca, revoked_serials=[7777], crl_number=11,
+                      delta_indicator=10)
+    base_der = base.public_bytes(serialization.Encoding.DER)
+    delta_der = delta.public_bytes(serialization.Encoding.DER)
+
+    def fake(url, timeout, max_bytes):
+        return 200, (delta_der if "delta" in url else base_der), False
+    monkeypatch.setattr(m, "_download_crl", fake)
+
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+                          DEFAULTS + ["delta_crl"])
+    # The serial is revoked only in the delta; applying the delta -> Revoked.
+    assert res.status == "Revoked", res.message
+    dc = next(c for c in res.checks if c["key"] == "delta_crl")
+    assert dc["status"] == "pass"
+    cs = next(c for c in res.checks if c["key"] == "cert_status")
+    assert cs["status"] == "fail"
+
+
+def test_delta_crl_no_pointer_passes(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    crl = _make_crl(ca_key, ca, crl_number=5)  # no Freshest CRL pointer
+    _stub_download(m, monkeypatch, crl)
+
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+                          DEFAULTS + ["delta_crl"])
+    assert res.status == "Valid", res.message
+    dc = next(c for c in res.checks if c["key"] == "delta_crl")
+    assert dc["status"] == "pass"
 
 
 def test_deselecting_cert_status_keeps_revoked_off_status(m, monkeypatch):

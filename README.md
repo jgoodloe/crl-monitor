@@ -68,6 +68,24 @@ Both the mode and the safety window can be configured globally (**Settings**)
 and overridden per monitor; leaving a monitor's value blank inherits the global
 default.
 
+### Retry on failure
+
+When a check **fails** (status `Error`), the monitor re-checks after a dedicated
+**retry interval** instead of waiting for the normal schedule, so a transient
+outage recovers quickly. With **exponential backoff** enabled the interval
+doubles per consecutive failure up to a cap; the streak resets on the first
+successful check. The retry interval is configurable globally and per monitor
+(`0` disables it, falling back to the normal schedule); backoff and its cap are
+global.
+
+### CRL data retention
+
+On every check the monitor captures a snapshot of the CRL's metadata
+(`thisUpdate`, `nextUpdate`, CRL number, status, response time). Snapshots are
+retained for a configurable number of days (**Settings → Keep CRL data for**;
+`0` keeps them indefinitely) and are viewable per monitor via the **CRL Data**
+button or the `GET /api/monitors/<id>/crl-data` endpoint.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Description |
@@ -240,7 +258,7 @@ recorded but no longer flips the monitor to an error.
 
 | Evaluation test | What it checks |
 |---|---|
-| **Certificate revocation status** | The certificate's serial is **not** present in the CRL's revoked list. |
+| **Certificate revocation status** | The certificate's serial is **not** present in the CRL's revoked list. When revoked, the message includes the revocation date and (if present) the CRLReason code (e.g. `keyCompromise`). |
 | **CRL signature verification** | The CRL is cryptographically signed by the issuer certificate. |
 | **CRL issuer match** | The CRL's `issuer` matches the issuer certificate's subject. |
 | **thisUpdate sanity** | `thisUpdate` (last update) is present and not future-dated (5 min skew). |
@@ -248,6 +266,7 @@ recorded but no longer flips the monitor to an error.
 | **CRL Number** | The `cRLNumber` extension is present and has not regressed below the last value seen for this monitor (a rollback can indicate a replayed/stale CRL). Off by default. |
 | **Signature algorithm strength** | The CRL is signed with a modern algorithm — fails on a weak hash (MD5 / SHA-1). EdDSA and SHA-256+ pass. Off by default. |
 | **Issuing Distribution Point** | The CRL's `issuingDistributionPoint` scope is consistent with the certificate (user/CA/attribute-cert scope) and the fetched URL. An absent IDP passes (the extension is optional). Off by default. |
+| **Delta CRL** | Follows the **Freshest CRL** pointer, fetches and verifies the delta CRL (Delta CRL Indicator + signature), and applies its entries over the base when determining revocation. Passes when no delta is referenced. Off by default. |
 | **Response-time threshold** | The CRL download round-trip is under a configurable limit (ms). Off by default. |
 
 Selection works at two levels:
@@ -255,8 +274,8 @@ Selection works at two levels:
 - **Global default** (Settings → *Default verification tests*) applies to every
   monitor that doesn't override it. Stored in the `default_tests` setting. The
   default set is everything *except* **CRL Number**, **Signature algorithm
-  strength**, **Issuing Distribution Point**, and **Response-time threshold**,
-  which are opt-in.
+  strength**, **Issuing Distribution Point**, **Delta CRL**, and
+  **Response-time threshold**, which are opt-in.
 - **Per monitor** (Add/Edit → *Verification tests*) either inherits the global
   default or pins its own set.
 
@@ -284,6 +303,7 @@ All endpoints are under `<prefix>/api`:
 | POST | `/api/monitors/{id}/enable` | Enable the monitor (audited). |
 | POST | `/api/monitors/{id}/disable` | Disable the monitor (audited). |
 | GET | `/api/monitors/{id}/history?limit=N` | Status-change history (with `id` + `comment`). |
+| GET | `/api/monitors/{id}/crl-data?limit=N` | Captured CRL-metadata snapshots over time (newest first). |
 | GET | `/api/monitors/{id}/audit` | Enable/disable/create audit log. |
 | PUT | `/api/history/{id}` | Set/clear the comment on a status-change row. |
 | GET/POST | `/api/maintenance` | List / create maintenance windows. |

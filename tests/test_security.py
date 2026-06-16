@@ -277,6 +277,40 @@ def test_monitor_schedule_fields_round_trip(m):
     assert d2["schedule_mode"] is None
 
 
+def test_retry_and_retention_settings_round_trip(m):
+    client = m.app.test_client()
+    s = client.get("/api/settings").get_json()
+    for k in ("default_retry_min", "retry_backoff", "retry_max_min",
+              "crl_data_retention_days"):
+        assert k in s
+
+    r = client.put("/api/settings", json={
+        "default_retry_min": 9, "retry_backoff": True,
+        "retry_max_min": 240, "crl_data_retention_days": 30,
+    }, headers=_csrf())
+    assert r.status_code == 200
+    out = r.get_json()
+    assert int(out["default_retry_min"]) == 9
+    assert out["retry_backoff"] is True
+    assert int(out["retry_max_min"]) == 240
+    assert int(out["crl_data_retention_days"]) == 30
+
+
+def test_monitor_retry_min_round_trips(m):
+    client = m.app.test_client()
+    rid = _make_monitor(client, retry_min=3)
+    assert client.get(f"/api/monitors/{rid}").get_json()["retry_min"] == 3
+
+
+def test_crl_data_endpoint_returns_snapshots(m):
+    client = m.app.test_client()
+    rid = _make_monitor(client)  # dummy PEM -> the check errors, but still snapshots
+    client.post(f"/api/monitors/{rid}/check", headers=_csrf())
+    data = client.get(f"/api/monitors/{rid}/crl-data").get_json()
+    assert isinstance(data, list) and len(data) >= 1
+    assert "captured_at" in data[0] and "status" in data[0]
+
+
 def test_update_push_url_is_authoritative(m):
     client = m.app.test_client()
     url = "https://status.example.com/api/push/TOK1"

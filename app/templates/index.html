@@ -181,6 +181,14 @@
         <input type="number" id="f_safety" min="0" placeholder="inherit global default">
       </div>
     </div>
+    <div class="row">
+      <div>
+        <label>Retry after failure (minutes)
+          <span class="muted">— re-check sooner after an error; 0 disables; blank inherits</span></label>
+        <input type="number" id="f_retry" min="0" placeholder="inherit global default">
+      </div>
+      <div></div>
+    </div>
     <div class="check">
       <input type="checkbox" id="f_enabled" checked>
       <label for="f_enabled" style="margin:0">Enabled</label>
@@ -220,6 +228,17 @@
   </div>
 </div>
 
+<!-- CRL data modal -->
+<div class="overlay" id="crlDataOverlay">
+  <div class="modal">
+    <h2 id="crlDataTitle">CRL data</h2>
+    <div id="crlDataBody" class="small"></div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeCrlData()">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- Settings modal -->
 <div class="overlay" id="settingsOverlay">
   <div class="modal">
@@ -254,6 +273,23 @@
       publication and propagation delays.
     </div>
     <input type="number" id="s_safety" min="0" placeholder="60">
+    <label style="margin-top:16px">Default retry after failure (minutes)</label>
+    <div class="muted small" style="margin-bottom:6px">
+      After a failed check, re-check after this interval instead of the normal
+      schedule. 0 disables. Used by monitors that don't set their own.
+    </div>
+    <input type="number" id="s_retry" min="0" placeholder="5">
+    <div class="settings-row">
+      <input type="checkbox" id="s_backoff"><label for="s_backoff" style="margin:0">Exponential backoff on repeated failures</label>
+    </div>
+    <label style="margin-top:8px">Retry backoff cap (minutes)</label>
+    <input type="number" id="s_retrymax" min="1" placeholder="120">
+    <label style="margin-top:16px">Keep CRL data for (days)</label>
+    <div class="muted small" style="margin-bottom:6px">
+      How long captured CRL metadata snapshots are retained. 0 keeps them
+      indefinitely.
+    </div>
+    <input type="number" id="s_retention" min="0" placeholder="90">
     <label style="margin-top:16px">Maximum CRL download size (MiB)</label>
     <div class="muted small" style="margin-bottom:6px">
       CRLs larger than this are rejected. Raise it for large CRLs (some
@@ -441,6 +477,7 @@ async function load() {
           <button class="secondary tiny" onclick="checkNow(${r.id})">Check</button>
           <button class="secondary tiny" onclick="toggleEnabled(${r.id}, ${r.enabled ? 'true' : 'false'})">${r.enabled ? 'Disable' : 'Enable'}</button>
           <button class="secondary tiny" onclick="showHist(${r.id})">History</button>
+          <button class="secondary tiny" onclick="showCrlData(${r.id})">CRL Data</button>
           <button class="secondary tiny" onclick="editRow(${r.id})">Edit</button>
           <button class="secondary tiny" onclick="cloneRow(${r.id})">Clone</button>
           <button class="danger tiny" onclick="delRow(${r.id})">Del</button>
@@ -462,7 +499,7 @@ function testPills(checks) {
 function openForm() {
   editingId = null;
   document.getElementById('formTitle').textContent = 'Add monitor';
-  ['f_alias','f_cert','f_issuer','f_uri','f_kuma','f_resptime','f_safety'].forEach(i => document.getElementById(i).value = '');
+  ['f_alias','f_cert','f_issuer','f_uri','f_kuma','f_resptime','f_safety','f_retry'].forEach(i => document.getElementById(i).value = '');
   document.getElementById('f_kuma').placeholder = 'https://status.example.com/api/push/TOKEN';
   document.getElementById('f_freq').value = 60;
   document.getElementById('f_sched').value = '';
@@ -491,6 +528,7 @@ function populateForm(r) {
   document.getElementById('f_resptime').value = (r.response_time_ms == null ? '' : r.response_time_ms);
   document.getElementById('f_sched').value = r.schedule_mode || '';
   document.getElementById('f_safety').value = (r.safety_window_min == null ? '' : r.safety_window_min);
+  document.getElementById('f_retry').value = (r.retry_min == null ? '' : r.retry_min);
   const inherit = (r.tests == null);
   document.getElementById('f_tests_inherit').checked = inherit;
   renderTestChecks('f_tests_box', 'f_t_', inherit ? globalDefaultTests : r.tests);
@@ -536,6 +574,8 @@ async function saveForm() {
     schedule_mode: document.getElementById('f_sched').value || null,
     safety_window_min: document.getElementById('f_safety').value === ''
       ? null : parseInt(document.getElementById('f_safety').value),
+    retry_min: document.getElementById('f_retry').value === ''
+      ? null : parseInt(document.getElementById('f_retry').value),
   };
   const btn = document.getElementById('saveBtn');
   btn.disabled = true;
@@ -595,6 +635,26 @@ async function showHist(id) {
 }
 function closeHist() { document.getElementById('histOverlay').classList.remove('open'); }
 
+async function showCrlData(id) {
+  const alias = aliasFor(id);
+  document.getElementById('crlDataTitle').textContent = 'CRL data — ' + alias;
+  const body = document.getElementById('crlDataBody');
+  body.innerHTML = '<span class="muted">Loading…</span>';
+  document.getElementById('crlDataOverlay').classList.add('open');
+  const res = await fetch(API('/monitors/' + id + '/crl-data?limit=200'));
+  const data = await res.json();
+  if (!data.length) { body.innerHTML = '<span class="muted">No CRL data captured yet.</span>'; return; }
+  body.innerHTML = data.map(d =>
+    `<div class="hist-row">
+       <span><span class="badge ${d.status}">${d.status}</span>
+         #${esc(d.crl_number || '—')} ·
+         next ${fmt(d.next_update)} ·
+         ${d.response_ms != null ? d.response_ms + ' ms' : '—'}</span>
+       <span class="muted">${fmt(d.captured_at)}</span>
+     </div>`).join('');
+}
+function closeCrlData() { document.getElementById('crlDataOverlay').classList.remove('open'); }
+
 async function openSettings() {
   const res = await fetch(API('/settings'));
   const s = await res.json();
@@ -608,6 +668,13 @@ async function openSettings() {
     (s.default_schedule_mode === 'next_update') ? 'next_update' : 'frequency';
   document.getElementById('s_safety').value =
     (s.default_safety_window_min == null ? '' : s.default_safety_window_min);
+  document.getElementById('s_retry').value =
+    (s.default_retry_min == null ? '' : s.default_retry_min);
+  document.getElementById('s_backoff').checked = !!s.retry_backoff;
+  document.getElementById('s_retrymax').value =
+    (s.retry_max_min == null ? '' : s.retry_max_min);
+  document.getElementById('s_retention').value =
+    (s.crl_data_retention_days == null ? '' : s.crl_data_retention_days);
   const maxBytes = parseInt(s.max_crl_bytes) || (16 * 1024 * 1024);
   document.getElementById('s_maxcrl').value = Math.round(maxBytes / (1024 * 1024));
   document.getElementById('settingsOverlay').classList.add('open');
@@ -624,6 +691,19 @@ async function saveSettings() {
     default_safety_window_min: (() => {
       const v = parseInt(document.getElementById('s_safety').value);
       return (isNaN(v) || v < 0) ? 60 : v;
+    })(),
+    default_retry_min: (() => {
+      const v = parseInt(document.getElementById('s_retry').value);
+      return (isNaN(v) || v < 0) ? 5 : v;
+    })(),
+    retry_backoff: document.getElementById('s_backoff').checked,
+    retry_max_min: (() => {
+      const v = parseInt(document.getElementById('s_retrymax').value);
+      return (isNaN(v) || v < 1) ? 120 : v;
+    })(),
+    crl_data_retention_days: (() => {
+      const v = parseInt(document.getElementById('s_retention').value);
+      return (isNaN(v) || v < 0) ? 90 : v;
     })(),
     max_crl_bytes: (parseInt(document.getElementById('s_maxcrl').value) || 16) * 1024 * 1024,
   });

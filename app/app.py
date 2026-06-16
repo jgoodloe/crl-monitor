@@ -121,6 +121,7 @@ EVAL_TESTS = [
     ("crl_number",    "CRL Number present and not regressed (no rollback)"),
     ("weak_signature", "Signature algorithm strength (no MD5/SHA-1)"),
     ("idp",           "Issuing Distribution Point scope consistency"),
+    ("delta_crl",     "Delta CRL fetched and applied (Freshest CRL)"),
     ("response_time", "Response-time threshold (download under the limit)"),
 ]
 # Foundational tests are prerequisites in a chain (each enables the next); when
@@ -163,6 +164,14 @@ DEFAULT_SCHEDULE_MODE = SCHEDULE_FREQUENCY
 # Fallback safety window (minutes) added after nextUpdate when neither monitor
 # nor global sets one.
 DEFAULT_SAFETY_WINDOW_MIN = 60
+# Failure-retry defaults: after a failed check, re-check after this interval
+# (instead of the normal schedule). With backoff enabled the interval doubles
+# per consecutive failure, capped at the max. retry_min <= 0 disables retry and
+# falls back to the normal schedule.
+DEFAULT_RETRY_MIN = 5
+DEFAULT_RETRY_MAX_MIN = 120
+# Days of CRL-metadata snapshots to retain (crl_snapshots); 0 keeps them forever.
+DEFAULT_CRL_DATA_RETENTION_DAYS = 90
 
 
 def parse_tests(value):
@@ -207,6 +216,11 @@ CREATE TABLE IF NOT EXISTS monitors (
     -- NULL on both => inherit the global scheduling defaults.
     schedule_mode    TEXT,
     safety_window_min INTEGER,
+    -- Retry interval (minutes) applied after a failed check; NULL inherits the
+    -- global default. consecutive_failures tracks the current failure streak
+    -- for exponential backoff (reset to 0 on the first non-error result).
+    retry_min        INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
     -- Last observed CRL Number (cRLNumber ext), kept as a decimal string since
     -- it can exceed 64 bits; used to detect a rolled-back/replayed CRL.
     last_crl_number  TEXT,
@@ -260,6 +274,23 @@ CREATE TABLE IF NOT EXISTS maintenance_windows (
 CREATE INDEX IF NOT EXISTS idx_maint_monitor
     ON maintenance_windows(monitor_id, start_ts);
 
+-- Time series of CRL metadata captured on each check, retained for a
+-- configurable period (crl_data_retention_days). Distinct from `history`,
+-- which only records status *changes*.
+CREATE TABLE IF NOT EXISTS crl_snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    monitor_id   INTEGER NOT NULL,
+    captured_at  TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    this_update  TEXT,
+    next_update  TEXT,
+    crl_number   TEXT,
+    response_ms  INTEGER,
+    FOREIGN KEY (monitor_id) REFERENCES monitors(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_snap_monitor
+    ON crl_snapshots(monitor_id, captured_at DESC);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -281,6 +312,14 @@ DEFAULT_SETTINGS = {
     # to any monitor that doesn't set its own.
     "default_schedule_mode": DEFAULT_SCHEDULE_MODE,
     "default_safety_window_min": str(DEFAULT_SAFETY_WINDOW_MIN),
+    # Failure-retry policy. default_retry_min is the base retry interval after a
+    # failed check (per monitor override via retry_min); retry_backoff enables
+    # exponential growth per consecutive failure, capped at retry_max_min.
+    "default_retry_min": str(DEFAULT_RETRY_MIN),
+    "retry_backoff": "false",
+    "retry_max_min": str(DEFAULT_RETRY_MAX_MIN),
+    # How long (days) to retain captured CRL-metadata snapshots; 0 = forever.
+    "crl_data_retention_days": str(DEFAULT_CRL_DATA_RETENTION_DAYS),
     # Maximum accepted CRL download size (bytes). Configurable at runtime so an
     # operator can raise it for large CRLs (e.g. some US-government CAs publish
     # CRLs of tens of MiB). Defaults to the MAX_CRL_BYTES env value.
@@ -316,6 +355,9 @@ def _migrate(db):
         ("schedule_mode", "ALTER TABLE monitors ADD COLUMN schedule_mode TEXT"),
         ("safety_window_min", "ALTER TABLE monitors ADD COLUMN safety_window_min INTEGER"),
         ("last_crl_number", "ALTER TABLE monitors ADD COLUMN last_crl_number TEXT"),
+        ("retry_min", "ALTER TABLE monitors ADD COLUMN retry_min INTEGER"),
+        ("consecutive_failures",
+         "ALTER TABLE monitors ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"),
     ):
         if col not in have:
             db.execute(ddl)
@@ -532,6 +574,80 @@ def _crl_number(crl):
         return None
 
 
+def _revocation_reason(revoked_entry):
+    """The RFC 5280 reason string (e.g. 'keyCompromise') from a revoked entry's
+    CRLReason extension, or None when the (optional) extension is absent."""
+    try:
+        return revoked_entry.extensions.get_extension_for_class(
+            x509.CRLReason).value.reason.value
+    except x509.ExtensionNotFound:
+        return None
+    except Exception:
+        return None
+
+
+def _freshest_crl_urls(obj):
+    """http/https delta-CRL URLs from a cert's or CRL's Freshest CRL extension."""
+    try:
+        ext = obj.extensions.get_extension_for_class(x509.FreshestCRL).value
+    except x509.ExtensionNotFound:
+        return []
+    except Exception:
+        return []
+    urls = []
+    for dp in ext:
+        for name in (dp.full_name or []):
+            if isinstance(name, x509.UniformResourceIdentifier):
+                v = name.value
+                if v and v.lower().startswith(("http://", "https://")):
+                    urls.append(v)
+    return urls
+
+
+def _resolve_delta(cert, base_crl, issuer, timeout, max_bytes):
+    """Locate, fetch and validate a delta CRL referenced by the base CRL or the
+    certificate's Freshest CRL pointer. Returns (delta_or_None, ok, message);
+    `delta` is non-None only when the delta is valid and applicable to the base.
+    """
+    urls = _freshest_crl_urls(base_crl) or _freshest_crl_urls(cert)
+    if not urls:
+        return None, True, "No delta CRL referenced (no Freshest CRL pointer)."
+    base_crl_num = _crl_number(base_crl)
+    last = "delta CRL distribution point unreachable."
+    for url in urls:
+        try:
+            status, content, too_large = _download_crl(url, timeout, max_bytes)
+        except UnsafeURLError as e:
+            log.warning("[CRL] blocked delta URL %r: %s", url, e)
+            last = "delta CRL URL blocked by egress policy."
+            continue
+        except requests.exceptions.RequestException as e:
+            log.warning("[CRL] delta CRL request failed for %r: %s", url, e)
+            continue
+        if status != 200:
+            last = "delta CRL distribution point did not return HTTP 200."
+            continue
+        if too_large:
+            return None, False, "Delta CRL exceeds the maximum download size."
+        try:
+            delta = _load_crl(content)
+        except Exception:
+            return None, False, "Delta CRL could not be parsed as DER or PEM."
+        ok_sig, _ = _verify_crl_signature(delta, issuer)
+        if not ok_sig:
+            return None, False, "Delta CRL signature does not verify against the issuer."
+        try:
+            base_number = delta.extensions.get_extension_for_class(
+                x509.DeltaCRLIndicator).value.crl_number
+        except x509.ExtensionNotFound:
+            return None, False, "Delta CRL lacks a Delta CRL Indicator (not a delta)."
+        if base_crl_num is not None and base_crl_num < base_number:
+            return None, False, (f"Base CRL number {base_crl_num} predates the delta's "
+                                 f"base {base_number}; delta not applicable.")
+        return delta, True, f"Delta CRL fetched and applied (delta base #{base_number})."
+    return None, False, last
+
+
 def _parse_crl_number(value):
     """Decode a stored CRL Number (decimal string) to int, or None."""
     if value is None or value == "":
@@ -658,17 +774,30 @@ def _crl_update_window(crl):
 
 def _evaluate_tests(enabled, crl, this_update, next_update, issuer, cert,
                     elapsed_ms=None, threshold_ms=0,
-                    crl_number=None, prev_crl_number=None, crl_url=None):
+                    crl_number=None, prev_crl_number=None, crl_url=None,
+                    delta_crl=None, delta_eval=None):
     """Run the enabled selectable tests against a successfully parsed CRL.
 
     Returns (checks, revoked) where `revoked` is True when the certificate's
     serial appears in the CRL's revoked list. `crl_number` is this CRL's
     cRLNumber (or None) and `prev_crl_number` is the last one seen for this
-    monitor, used for the rollback check.
+    monitor, used for the rollback check. When `delta_crl` is provided the
+    revocation lookup is merged over it (a delta entry with removeFromCRL clears
+    the revocation); `delta_eval` is the precomputed (ok, message) for the
+    delta_crl test.
     """
     now = datetime.now(timezone.utc)
     revoked_entry = crl.get_revoked_certificate_by_serial_number(cert.serial_number)
     revoked = revoked_entry is not None
+    # Apply the delta CRL over the base when one was fetched: a later entry wins,
+    # and a removeFromCRL reason lifts a (certificateHold) revocation.
+    if delta_crl is not None:
+        d_entry = delta_crl.get_revoked_certificate_by_serial_number(cert.serial_number)
+        if d_entry is not None:
+            if _revocation_reason(d_entry) == "removeFromCRL":
+                revoked, revoked_entry = False, None
+            else:
+                revoked, revoked_entry = True, d_entry
     checks = []
 
     def add(key, ok, message):
@@ -686,9 +815,11 @@ def _evaluate_tests(enabled, crl, this_update, next_update, issuer, cert,
                 rdate = revoked_entry.revocation_date_utc
             except AttributeError:
                 rdate = _aware(revoked_entry.revocation_date)
+            reason = _revocation_reason(revoked_entry)
+            reason_txt = f" Reason: {reason}." if reason else ""
             add("cert_status", False,
                 f"Certificate is revoked. Revocation date: "
-                f"{rdate.isoformat() if rdate else 'N/A'}.")
+                f"{rdate.isoformat() if rdate else 'N/A'}.{reason_txt}")
 
     if "crl_signature" in enabled:
         try:
@@ -750,6 +881,10 @@ def _evaluate_tests(enabled, crl, this_update, next_update, issuer, cert,
     if "idp" in enabled:
         ok, msg = _check_idp(crl, cert, crl_url)
         add("idp", ok, msg)
+
+    if "delta_crl" in enabled:
+        ok, msg = delta_eval if delta_eval else (True, "Delta CRL not evaluated.")
+        add("delta_crl", ok, msg)
 
     if "response_time" in enabled:
         limit = int(threshold_ms or 0)
@@ -941,10 +1076,17 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
     this_update, next_update = _crl_update_window(crl)
     crl_number = _crl_number(crl)
 
+    # Delta CRL support is opt-in: only fetch the delta when the test is enabled.
+    delta_crl, delta_eval = None, None
+    if "delta_crl" in enabled_set:
+        delta_crl, ok, msg = _resolve_delta(cert, crl, issuer, timeout, max_bytes)
+        delta_eval = (ok, msg)
+
     eval_checks, revoked = _evaluate_tests(
         enabled, crl, this_update, next_update, issuer, cert,
         elapsed_ms=elapsed_ms, threshold_ms=threshold_ms,
         crl_number=crl_number, prev_crl_number=prev_crl_number, crl_url=url,
+        delta_crl=delta_crl, delta_eval=delta_eval,
     )
     checks.extend(eval_checks)
 
@@ -1063,6 +1205,57 @@ def _compute_next_run(now, mode, frequency_min, safety_window_min, next_update_i
     return candidate if candidate > now else freq
 
 
+def resolve_retry_min(db, row):
+    """The failure-retry interval (minutes) for this monitor: its own if set,
+    else the global default. 0 (or less) means 'no special retry'."""
+    own = row["retry_min"] if "retry_min" in row.keys() else None
+    if own is not None:
+        try:
+            return int(own)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return int(get_setting(db, "default_retry_min", str(DEFAULT_RETRY_MIN)))
+    except (TypeError, ValueError):
+        return DEFAULT_RETRY_MIN
+
+
+def _compute_retry_run(now, consecutive_failures, retry_min, backoff, retry_max_min):
+    """Next-run time after a failed check. With backoff the interval doubles per
+    consecutive failure (1-based), capped at retry_max_min."""
+    base = max(1, int(retry_min))
+    if backoff:
+        cap = max(base, int(retry_max_min or base))
+        interval = min(base * (2 ** max(0, int(consecutive_failures) - 1)), cap)
+    else:
+        interval = base
+    return now + timedelta(minutes=interval)
+
+
+def _record_crl_snapshot(db, rid, now, result):
+    """Append a CRL-metadata snapshot for this check and prune snapshots older
+    than the configured retention window (crl_data_retention_days; 0 = keep
+    forever)."""
+    db.execute(
+        "INSERT INTO crl_snapshots (monitor_id, captured_at, status, this_update, "
+        "next_update, crl_number, response_ms) VALUES (?,?,?,?,?,?,?)",
+        (rid, now.isoformat(), result.status, result.this_update, result.next_update,
+         str(result.crl_number) if result.crl_number is not None else None,
+         result.response_ms),
+    )
+    try:
+        days = int(get_setting(db, "crl_data_retention_days",
+                               str(DEFAULT_CRL_DATA_RETENTION_DAYS)))
+    except (TypeError, ValueError):
+        days = DEFAULT_CRL_DATA_RETENTION_DAYS
+    if days > 0:
+        cutoff = (now - timedelta(days=days)).isoformat()
+        db.execute(
+            "DELETE FROM crl_snapshots WHERE monitor_id=? AND captured_at < ?",
+            (rid, cutoff),
+        )
+
+
 def check_monitor(db, row):
     rid = row["id"]
     alias = row["cert_alias"]
@@ -1091,11 +1284,25 @@ def check_monitor(db, row):
     )
 
     now = datetime.now(timezone.utc)
-    next_run = _compute_next_run(
-        now, schedule_mode, row["frequency_min"], safety_window_min,
-        result.next_update,
-    ).isoformat()
     prev_status = row["status"]
+    # Failure-retry: on an Error, re-check after the (optionally backing-off)
+    # retry interval instead of the normal schedule; reset the streak otherwise.
+    prev_failures = row["consecutive_failures"] if "consecutive_failures" in row.keys() else 0
+    retry_min = resolve_retry_min(db, row)
+    if result.status == "Error" and retry_min > 0:
+        consecutive = (prev_failures or 0) + 1
+        backoff = get_setting(db, "retry_backoff") == "true"
+        try:
+            retry_max = int(get_setting(db, "retry_max_min", str(DEFAULT_RETRY_MAX_MIN)))
+        except (TypeError, ValueError):
+            retry_max = DEFAULT_RETRY_MAX_MIN
+        next_run = _compute_retry_run(now, consecutive, retry_min, backoff, retry_max).isoformat()
+    else:
+        consecutive = 0 if result.status != "Error" else (prev_failures or 0)
+        next_run = _compute_next_run(
+            now, schedule_mode, row["frequency_min"], safety_window_min,
+            result.next_update,
+        ).isoformat()
     # Persist the newly observed CRL Number; keep the prior value on a run that
     # produced none (failed/unparsed CRL) so rollback detection survives blips.
     stored_crl_number = (str(result.crl_number) if result.crl_number is not None
@@ -1106,14 +1313,18 @@ def check_monitor(db, row):
         """UPDATE monitors
               SET last_run=?, next_run=?, status=?, last_message=?,
                   response_ms=?, this_update=?, next_update=?, last_checks=?,
-                  last_crl_number=?, updated_at=?
+                  last_crl_number=?, consecutive_failures=?, updated_at=?
             WHERE id=?""",
         (
             now.isoformat(), next_run, result.status, result.message,
             result.response_ms, result.this_update, result.next_update,
-            json.dumps(result.checks), stored_crl_number, now.isoformat(), rid,
+            json.dumps(result.checks), stored_crl_number, consecutive,
+            now.isoformat(), rid,
         ),
     )
+
+    # Capture a CRL-metadata snapshot and prune beyond the retention window.
+    _record_crl_snapshot(db, rid, now, result)
 
     if prev_status != result.status:
         db.execute(
@@ -1521,6 +1732,11 @@ def monitor_to_dict(row, include_pem=True):
                           if "schedule_mode" in row.keys() else None),
         "safety_window_min": (row["safety_window_min"]
                               if "safety_window_min" in row.keys() else None),
+        # None means "inherit the global retry interval".
+        "retry_min": (row["retry_min"] if "retry_min" in row.keys() else None),
+        # Read-only diagnostics.
+        "consecutive_failures": (row["consecutive_failures"]
+                                 if "consecutive_failures" in row.keys() else 0),
         # Read-only: the last observed CRL Number (decimal string), or None.
         "last_crl_number": (row["last_crl_number"]
                             if "last_crl_number" in row.keys() else None),
@@ -1615,6 +1831,12 @@ def _safety_window_or_none(value):
     return None if n is None else max(0, n)
 
 
+def _retry_min_or_none(value):
+    """Parse an optional retry interval (minutes, clamped >= 0); blank -> None."""
+    n = _int_or_none(value)
+    return None if n is None else max(0, n)
+
+
 def _validate_payload(data, partial=False):
     errors = []
     if not partial or "cert_alias" in data:
@@ -1647,9 +1869,9 @@ def create_monitor():
         """INSERT INTO monitors
            (cert_alias, cert_pem, issuer_pem, crl_uri, frequency_min,
             enabled, uptime_kuma_url, tests, response_time_ms,
-            schedule_mode, safety_window_min, next_run, status,
+            schedule_mode, safety_window_min, retry_min, next_run, status,
             last_message, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             data["cert_alias"].strip(),
             data["cert_pem"].strip(),
@@ -1662,6 +1884,7 @@ def create_monitor():
             _int_or_none(data.get("response_time_ms")),
             _schedule_mode_or_none(data.get("schedule_mode")),
             _safety_window_or_none(data.get("safety_window_min")),
+            _retry_min_or_none(data.get("retry_min")),
             now,  # schedule an immediate first run
             "Unknown",
             "Configuration created.",
@@ -1710,6 +1933,8 @@ def update_monitor(rid):
                           if "schedule_mode" in data else row["schedule_mode"]),
         "safety_window_min": (_safety_window_or_none(data["safety_window_min"])
                               if "safety_window_min" in data else row["safety_window_min"]),
+        "retry_min": (_retry_min_or_none(data["retry_min"])
+                      if "retry_min" in data else row["retry_min"]),
     }
     # Re-check immediately if cert material changed.
     next_run = row["next_run"]
@@ -1720,14 +1945,14 @@ def update_monitor(rid):
         """UPDATE monitors SET cert_alias=?, cert_pem=?, issuer_pem=?, crl_uri=?,
                frequency_min=?, enabled=?, uptime_kuma_url=?, tests=?,
                response_time_ms=?, schedule_mode=?, safety_window_min=?,
-               next_run=?, updated_at=?
+               retry_min=?, next_run=?, updated_at=?
            WHERE id=?""",
         (
             fields["cert_alias"], fields["cert_pem"], fields["issuer_pem"],
             fields["crl_uri"], fields["frequency_min"], fields["enabled"],
             fields["uptime_kuma_url"], fields["tests"], fields["response_time_ms"],
             fields["schedule_mode"], fields["safety_window_min"],
-            next_run, now_iso(), rid,
+            fields["retry_min"], next_run, now_iso(), rid,
         ),
     )
     # Audit an enable/disable that happened via the edit form.
@@ -1808,6 +2033,21 @@ def monitor_history(rid):
     rows = db.execute(
         "SELECT id, status, message, timestamp, comment FROM history "
         "WHERE monitor_id=? ORDER BY timestamp DESC LIMIT ?",
+        (rid, limit),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/monitors/<int:rid>/crl-data", methods=["GET"])
+def monitor_crl_data(rid):
+    """Captured CRL-metadata snapshots over time (newest first), retained per
+    the crl_data_retention_days setting."""
+    db = get_db()
+    limit = min(int(request.args.get("limit", 200)), 1000)
+    rows = db.execute(
+        "SELECT captured_at, status, this_update, next_update, crl_number, "
+        "response_ms FROM crl_snapshots WHERE monitor_id=? "
+        "ORDER BY captured_at DESC LIMIT ?",
         (rid, limit),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
@@ -1976,6 +2216,15 @@ def put_settings():
         elif k == "default_safety_window_min":
             n = _int_or_none(v)
             sv = str(max(0, n) if n is not None else DEFAULT_SAFETY_WINDOW_MIN)
+        elif k == "default_retry_min":
+            n = _int_or_none(v)
+            sv = str(max(0, n) if n is not None else DEFAULT_RETRY_MIN)
+        elif k == "retry_max_min":
+            n = _int_or_none(v)
+            sv = str(max(1, n) if n is not None else DEFAULT_RETRY_MAX_MIN)
+        elif k == "crl_data_retention_days":
+            n = _int_or_none(v)
+            sv = str(max(0, n) if n is not None else DEFAULT_CRL_DATA_RETENTION_DAYS)
         elif v is True:
             sv = "true"
         elif v is False:
