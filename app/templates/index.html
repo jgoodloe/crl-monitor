@@ -449,10 +449,11 @@ function fmt(dt) {
   return isNaN(d) ? dt : d.toLocaleString();
 }
 // A CRL issuer DN can be long; show its CN (or first RDN) for compactness.
+// Returns the raw value; callers escape at the render boundary (like other fields).
 function crlIssuerCN(dn) {
   if (!dn) return '—';
   const m = dn.match(/CN=([^,]+)/i);
-  return esc(m ? m[1].trim() : dn.split(',')[0].trim());
+  return m ? m[1].trim() : dn.split(',')[0].trim();
 }
 // Human-readable "time remaining" from a whole-second count (may be negative
 // when the CRL had already expired at capture time).

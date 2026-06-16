@@ -601,7 +601,12 @@ def _crl_issuer(crl):
 
 def _revoked_count(crl):
     """Return the number of revoked certificates listed in the CRL, or None
-    when the count cannot be determined."""
+    when the count cannot be determined.
+
+    The work here is bounded by the CRL download size cap (`max_crl_bytes`):
+    the CRL is already fully fetched and size-limited before we count, so the
+    number of revoked entries is proportional to the accepted payload. Keep any
+    future per-entry processing bounded by that same cap (see issue #13)."""
     try:
         return len(crl)
     except Exception:

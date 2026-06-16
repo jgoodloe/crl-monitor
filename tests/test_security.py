@@ -160,6 +160,35 @@ def test_template_has_no_alias_in_inline_handlers():
     assert "delRow(${r.id})" in html
 
 
+def test_crl_issuer_is_escaped_in_crl_data_view():
+    """The CRL issuer DN is attacker-influenced (the CRL is fetched from a
+    distribution point), so it must reach the DOM only through esc(). Guards
+    issue #11."""
+    html = open(TEMPLATE_PATH, encoding="utf-8").read()
+    # Rendered through esc() at the call site, exactly once (issue #10).
+    assert "esc(crlIssuerCN(d.crl_issuer))" in html
+    # The helper itself must not pre-escape (double-escaping) nor must the field
+    # ever be interpolated raw.
+    assert "return esc(" not in html.split("function crlIssuerCN")[1].split("}")[0]
+    assert "${d.crl_issuer}" not in html
+    assert "${crlIssuerCN(d.crl_issuer)}" not in html
+    # The CRL number is likewise escaped.
+    assert "esc(d.crl_number" in html
+
+
+def test_crl_snapshot_insert_is_parameterized():
+    """Snapshot writes must bind CRL-derived values as parameters, never format
+    them into the SQL string. Guards issue #12."""
+    src = open(APP_PATH, encoding="utf-8").read()
+    # The INSERT lists the columns and uses only ? placeholders for VALUES.
+    assert "INSERT INTO crl_snapshots" in src
+    assert "VALUES (?,?,?,?,?,?,?,?,?)" in src
+    # No f-string / %-format / .format INSERT into the snapshots table.
+    assert 'f"INSERT INTO crl_snapshots' not in src
+    assert "f'INSERT INTO crl_snapshots" not in src
+    assert "%" not in src.split("INSERT INTO crl_snapshots")[1].split(")", 1)[0]
+
+
 def test_alias_round_trips_as_json_data(m):
     """A quote-laden alias is stored/returned verbatim as JSON (not HTML),
     so rendering safety stays a client concern and the data path isn't mangled."""
