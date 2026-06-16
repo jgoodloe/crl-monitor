@@ -118,6 +118,7 @@ EVAL_TESTS = [
     ("issuer_match",  "CRL issuer matches the issuer certificate"),
     ("this_update",   "thisUpdate sanity (present, not future-dated)"),
     ("next_update",   "nextUpdate freshness (present, not in the past)"),
+    ("crl_number",    "CRL Number present and not regressed (no rollback)"),
     ("response_time", "Response-time threshold (download under the limit)"),
 ]
 # Foundational tests are prerequisites in a chain (each enables the next); when
@@ -204,6 +205,9 @@ CREATE TABLE IF NOT EXISTS monitors (
     -- NULL on both => inherit the global scheduling defaults.
     schedule_mode    TEXT,
     safety_window_min INTEGER,
+    -- Last observed CRL Number (cRLNumber ext), kept as a decimal string since
+    -- it can exceed 64 bits; used to detect a rolled-back/replayed CRL.
+    last_crl_number  TEXT,
     last_checks     TEXT,
     last_run        TEXT,
     next_run        TEXT,
@@ -309,6 +313,7 @@ def _migrate(db):
     for col, ddl in (
         ("schedule_mode", "ALTER TABLE monitors ADD COLUMN schedule_mode TEXT"),
         ("safety_window_min", "ALTER TABLE monitors ADD COLUMN safety_window_min INTEGER"),
+        ("last_crl_number", "ALTER TABLE monitors ADD COLUMN last_crl_number TEXT"),
     ):
         if col not in have:
             db.execute(ddl)
@@ -466,12 +471,16 @@ def _pinned_request(method, url, hostname, pinned_ip, **kwargs):
 # --------------------------------------------------------------------------- #
 class CRLResult:
     def __init__(self, status, message, response_ms=None,
-                 this_update=None, next_update=None, checks=None):
+                 this_update=None, next_update=None, checks=None,
+                 crl_number=None):
         self.status = status            # Valid | Revoked | Error | Unknown
         self.message = message
         self.response_ms = response_ms
         self.this_update = this_update
         self.next_update = next_update
+        # The CRL Number (int) observed this run, or None when absent/unparsed.
+        # Carried out so the worker can persist it for rollback detection.
+        self.crl_number = crl_number
         # Per-test outcomes: list of {key, label, status, message} where status
         # is one of pass | fail | skip.
         self.checks = checks or []
@@ -508,6 +517,27 @@ def _load_crl(content):
         return x509.load_der_x509_crl(content)
     except Exception:
         return x509.load_pem_x509_crl(content)
+
+
+def _crl_number(crl):
+    """Return the CRL Number (int) from the cRLNumber extension, or None when
+    the extension is absent or cannot be read."""
+    try:
+        return crl.extensions.get_extension_for_class(x509.CRLNumber).value.crl_number
+    except x509.ExtensionNotFound:
+        return None
+    except Exception:
+        return None
+
+
+def _parse_crl_number(value):
+    """Decode a stored CRL Number (decimal string) to int, or None."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # Allow a little clock skew before calling a thisUpdate "future-dated".
@@ -560,11 +590,14 @@ def _crl_update_window(crl):
 
 
 def _evaluate_tests(enabled, crl, this_update, next_update, issuer, cert,
-                    elapsed_ms=None, threshold_ms=0):
+                    elapsed_ms=None, threshold_ms=0,
+                    crl_number=None, prev_crl_number=None):
     """Run the enabled selectable tests against a successfully parsed CRL.
 
     Returns (checks, revoked) where `revoked` is True when the certificate's
-    serial appears in the CRL's revoked list.
+    serial appears in the CRL's revoked list. `crl_number` is this CRL's
+    cRLNumber (or None) and `prev_crl_number` is the last one seen for this
+    monitor, used for the rollback check.
     """
     now = datetime.now(timezone.utc)
     revoked_entry = crl.get_revoked_certificate_by_serial_number(cert.serial_number)
@@ -622,6 +655,17 @@ def _evaluate_tests(enabled, crl, this_update, next_update, issuer, cert,
                 f"CRL is stale (nextUpdate {next_update.isoformat()} is in the past).")
         else:
             add("next_update", True, "nextUpdate is present and not in the past.")
+
+    if "crl_number" in enabled:
+        if crl_number is None:
+            add("crl_number", False, "CRL has no CRL Number extension (cRLNumber).")
+        elif prev_crl_number is not None and crl_number < prev_crl_number:
+            add("crl_number", False,
+                f"CRL Number regressed (was {prev_crl_number}, now {crl_number}); "
+                f"a rollback can indicate a replayed or stale CRL.")
+        else:
+            suffix = "" if prev_crl_number is None else f" (>= previous {prev_crl_number})"
+            add("crl_number", True, f"CRL Number is {crl_number}{suffix}.")
 
     if "response_time" in enabled:
         limit = int(threshold_ms or 0)
@@ -693,7 +737,8 @@ def _download_crl(url, timeout, max_bytes):
 
 
 def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
-                  timeout=CRL_TIMEOUT, threshold_ms=0, max_bytes=MAX_CRL_BYTES):
+                  timeout=CRL_TIMEOUT, threshold_ms=0, max_bytes=MAX_CRL_BYTES,
+                  prev_crl_number=None):
     """Resolve a CRL distribution point, download the CRL, parse it, and
     evaluate the selected verification tests.
 
@@ -714,7 +759,8 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
             checks.append({"key": key, "label": TEST_LABELS[key],
                            "status": "pass" if ok else "fail", "message": message})
 
-    def finish(response_ms=None, this_update=None, next_update=None, revoked=False):
+    def finish(response_ms=None, this_update=None, next_update=None, revoked=False,
+               crl_number=None):
         # Any selected test we never reached couldn't run -> skip.
         done = {c["key"] for c in checks}
         for k in enabled:
@@ -727,7 +773,7 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
             _derive_status(checks, revoked),
             _compose_message(checks, enabled),
             response_ms=response_ms, this_update=this_update,
-            next_update=next_update, checks=checks,
+            next_update=next_update, checks=checks, crl_number=crl_number,
         )
 
     start = time.monotonic()
@@ -809,15 +855,18 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
         return dt.isoformat() if dt else None
 
     this_update, next_update = _crl_update_window(crl)
+    crl_number = _crl_number(crl)
 
     eval_checks, revoked = _evaluate_tests(
         enabled, crl, this_update, next_update, issuer, cert,
         elapsed_ms=elapsed_ms, threshold_ms=threshold_ms,
+        crl_number=crl_number, prev_crl_number=prev_crl_number,
     )
     checks.extend(eval_checks)
 
     return finish(response_ms=elapsed_ms, this_update=_fmt(this_update),
-                  next_update=_fmt(next_update), revoked=revoked)
+                  next_update=_fmt(next_update), revoked=revoked,
+                  crl_number=crl_number)
 
 
 # --------------------------------------------------------------------------- #
@@ -948,9 +997,13 @@ def check_monitor(db, row):
                  alias, rid, row["crl_uri"], ",".join(enabled_tests) or "none",
                  threshold_ms, max_bytes, schedule_mode, safety_window_min)
 
+    prev_crl_number = _parse_crl_number(
+        row["last_crl_number"] if "last_crl_number" in row.keys() else None)
+
     result = run_crl_check(
         row["cert_pem"], row["issuer_pem"], row["crl_uri"], enabled_tests,
         threshold_ms=threshold_ms, max_bytes=max_bytes,
+        prev_crl_number=prev_crl_number,
     )
 
     now = datetime.now(timezone.utc)
@@ -959,17 +1012,22 @@ def check_monitor(db, row):
         result.next_update,
     ).isoformat()
     prev_status = row["status"]
+    # Persist the newly observed CRL Number; keep the prior value on a run that
+    # produced none (failed/unparsed CRL) so rollback detection survives blips.
+    stored_crl_number = (str(result.crl_number) if result.crl_number is not None
+                         else (row["last_crl_number"]
+                               if "last_crl_number" in row.keys() else None))
 
     db.execute(
         """UPDATE monitors
               SET last_run=?, next_run=?, status=?, last_message=?,
                   response_ms=?, this_update=?, next_update=?, last_checks=?,
-                  updated_at=?
+                  last_crl_number=?, updated_at=?
             WHERE id=?""",
         (
             now.isoformat(), next_run, result.status, result.message,
             result.response_ms, result.this_update, result.next_update,
-            json.dumps(result.checks), now.isoformat(), rid,
+            json.dumps(result.checks), stored_crl_number, now.isoformat(), rid,
         ),
     )
 
@@ -1379,6 +1437,9 @@ def monitor_to_dict(row, include_pem=True):
                           if "schedule_mode" in row.keys() else None),
         "safety_window_min": (row["safety_window_min"]
                               if "safety_window_min" in row.keys() else None),
+        # Read-only: the last observed CRL Number (decimal string), or None.
+        "last_crl_number": (row["last_crl_number"]
+                            if "last_crl_number" in row.keys() else None),
         "last_checks": _load_checks(row["last_checks"] if "last_checks" in row.keys() else None),
         "last_run": row["last_run"],
         "next_run": row["next_run"],

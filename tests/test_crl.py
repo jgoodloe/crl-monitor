@@ -69,7 +69,7 @@ def _make_leaf(ca_key, ca_cert, cn="leaf", serial=None):
 
 
 def _make_crl(ca_key, ca_cert, revoked_serials=(),
-              last_days=-1, next_days=7):
+              last_days=-1, next_days=7, crl_number=None):
     now = datetime.now(timezone.utc)
     builder = (
         x509.CertificateRevocationListBuilder()
@@ -77,6 +77,8 @@ def _make_crl(ca_key, ca_cert, revoked_serials=(),
         .last_update(now + timedelta(days=last_days))
         .next_update(now + timedelta(days=next_days))
     )
+    if crl_number is not None:
+        builder = builder.add_extension(x509.CRLNumber(crl_number), critical=False)
     for s in revoked_serials:
         rc = (
             x509.RevokedCertificateBuilder()
@@ -223,6 +225,96 @@ def test_compute_next_run_falls_back_when_no_next_update(m):
     now = datetime.now(timezone.utc)
     nr = m._compute_next_run(now, "next_update", 45, 60, None)
     assert abs((nr - (now + timedelta(minutes=45))).total_seconds()) < 1
+
+
+CRL_NUM_TESTS = DEFAULTS + ["crl_number"]
+
+
+def test_crl_number_present_passes(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    crl = _make_crl(ca_key, ca, crl_number=7)
+    _stub_download(m, monkeypatch, crl)
+
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl", CRL_NUM_TESTS)
+    assert res.status == "Valid", res.message
+    assert res.crl_number == 7
+    cn = next(c for c in res.checks if c["key"] == "crl_number")
+    assert cn["status"] == "pass"
+
+
+def test_crl_number_absent_fails(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    crl = _make_crl(ca_key, ca)  # no CRL Number extension
+    _stub_download(m, monkeypatch, crl)
+
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl", CRL_NUM_TESTS)
+    assert res.status == "Error"
+    assert res.crl_number is None
+    cn = next(c for c in res.checks if c["key"] == "crl_number")
+    assert cn["status"] == "fail"
+
+
+def test_crl_number_regression_fails(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    crl = _make_crl(ca_key, ca, crl_number=5)
+    _stub_download(m, monkeypatch, crl)
+
+    # A lower number than last seen (10) is a rollback -> fail.
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+                          CRL_NUM_TESTS, prev_crl_number=10)
+    assert res.status == "Error"
+    cn = next(c for c in res.checks if c["key"] == "crl_number")
+    assert cn["status"] == "fail"
+
+
+def test_crl_number_monotonic_increase_passes(m, monkeypatch):
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    crl = _make_crl(ca_key, ca, crl_number=11)
+    _stub_download(m, monkeypatch, crl)
+
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+                          CRL_NUM_TESTS, prev_crl_number=5)
+    assert res.status == "Valid", res.message
+    cn = next(c for c in res.checks if c["key"] == "crl_number")
+    assert cn["status"] == "pass"
+
+
+def test_check_monitor_persists_crl_number_and_detects_rollback(m, monkeypatch):
+    """End-to-end through the worker: the CRL Number is persisted, then a later
+    lower number is flagged as a rollback (Error)."""
+    from contextlib import closing
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    with closing(m.raw_db()) as db:
+        ts = m.now_iso()
+        cur = db.execute(
+            "INSERT INTO monitors (cert_alias, cert_pem, issuer_pem, crl_uri, "
+            "tests, frequency_min, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            ("rollback", _pem(leaf), _pem(ca), "http://crl.test/ca.crl",
+             ",".join(CRL_NUM_TESTS), 60, ts, ts),
+        )
+        rid = cur.lastrowid
+        db.commit()
+
+        crl1 = _make_crl(ca_key, ca, crl_number=10)
+        _stub_download(m, monkeypatch, crl1)
+        row = db.execute("SELECT * FROM monitors WHERE id=?", (rid,)).fetchone()
+        res1 = m.check_monitor(db, row)
+        assert res1.status == "Valid", res1.message
+        assert db.execute("SELECT last_crl_number FROM monitors WHERE id=?",
+                          (rid,)).fetchone()["last_crl_number"] == "10"
+
+        crl2 = _make_crl(ca_key, ca, crl_number=4)  # rolled back
+        _stub_download(m, monkeypatch, crl2)
+        row = db.execute("SELECT * FROM monitors WHERE id=?", (rid,)).fetchone()
+        res2 = m.check_monitor(db, row)
+        assert res2.status == "Error", res2.message
+        cn = next(c for c in res2.checks if c["key"] == "crl_number")
+        assert cn["status"] == "fail"
 
 
 def test_deselecting_cert_status_keeps_revoked_off_status(m, monkeypatch):

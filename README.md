@@ -245,13 +245,15 @@ recorded but no longer flips the monitor to an error.
 | **CRL issuer match** | The CRL's `issuer` matches the issuer certificate's subject. |
 | **thisUpdate sanity** | `thisUpdate` (last update) is present and not future-dated (5 min skew). |
 | **nextUpdate freshness** | `nextUpdate` is present and not already in the past (stale CRL). |
+| **CRL Number** | The `cRLNumber` extension is present and has not regressed below the last value seen for this monitor (a rollback can indicate a replayed/stale CRL). Off by default. |
 | **Response-time threshold** | The CRL download round-trip is under a configurable limit (ms). Off by default. |
 
 Selection works at two levels:
 
 - **Global default** (Settings → *Default verification tests*) applies to every
   monitor that doesn't override it. Stored in the `default_tests` setting. The
-  default set is everything *except* **Response-time threshold**, which is opt-in.
+  default set is everything *except* **CRL Number** and **Response-time
+  threshold**, which are opt-in.
 - **Per monitor** (Add/Edit → *Verification tests*) either inherits the global
   default or pins its own set.
 
