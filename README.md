@@ -17,6 +17,38 @@ The UI and API are served by the same Flask process on the same origin, and
 every request the browser makes is **relative**, so the app works behind a
 reverse proxy — including under a subpath — with no URL configuration.
 
+## Screenshots
+
+### Dashboard
+Monitors at a glance — status, the per-check result pills (toggleable in
+**Settings**), download time, next update, and per-monitor actions.
+
+![CRL Monitor dashboard](docs/screenshots/dashboard.png)
+
+### Uptime reports
+Time-weighted uptime over a window, with a downtime list, editable comments, and
+the ability to **exclude** (or re-include) an individual outage from the
+calculation.
+
+![Uptime report with per-outage exclusion](docs/screenshots/reports.png)
+
+### Add / edit a monitor
+Certificate and issuer PEMs, scheduling, and the individually selectable
+verification tests.
+
+![Add or edit monitor form](docs/screenshots/edit-monitor.png)
+
+### CRL data history
+Per-check snapshots of the CRL metadata — issuing CA, CRL number, revoked
+count, time remaining, and next update.
+
+![CRL data history](docs/screenshots/crl-data.png)
+
+### Status history
+The record of status changes, each with the reason for the change.
+
+![Status-change history](docs/screenshots/history.png)
+
 ## Why single-container
 
 - **One upstream for your reverse proxy.** No CORS, no cross-service routing, no
