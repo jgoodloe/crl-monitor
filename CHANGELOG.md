@@ -8,6 +8,8 @@ with a `v` prefix (e.g. `v1.2.0`).
 
 ## [Unreleased]
 
+## [v1.1.1] - 2026-06-17
+
 ### Added
 - Uptime Kuma push outcome is now recorded and surfaced: `push_to_uptime_kuma`
   checks for the `{"ok":true}` acknowledgement and returns `ok` / `blocked` /
@@ -58,6 +60,7 @@ checks, uptime reporting, and CRL-metadata history.
 - Packaging: Docker image published to GHCR and a `docker-compose.yml` for a
   single-container deployment.
 
-[Unreleased]: https://github.com/jgoodloe/crl-monitor/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/jgoodloe/crl-monitor/compare/v1.1.1...HEAD
+[v1.1.1]: https://github.com/jgoodloe/crl-monitor/compare/v1.1.0...v1.1.1
 [v1.1.0]: https://github.com/jgoodloe/crl-monitor/compare/v1.0.0...v1.1.0
 [v1.0.0]: https://github.com/jgoodloe/crl-monitor/releases/tag/v1.0.0
