@@ -243,6 +243,8 @@ CREATE TABLE IF NOT EXISTS history (
     message      TEXT NOT NULL DEFAULT '',
     timestamp    TEXT NOT NULL,
     comment      TEXT,
+    -- Operator flag (0/1): exclude this outage from uptime calculations.
+    -- Persisted here so the choice is remembered across future reports.
     uptime_excluded INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (monitor_id) REFERENCES monitors(id) ON DELETE CASCADE
 );
@@ -1622,6 +1624,8 @@ def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
             downtimes.append({
                 "hist_id": row["id"], "status": row["status"],
                 "reason": row["message"], "comment": row["comment"],
+                # Whether the operator has excluded this specific outage from
+                # the uptime calculation (persisted history.uptime_excluded).
                 "user_excluded": bool(row["uptime_excluded"]),
                 "_start": s, "_end": e,
             })
@@ -1672,6 +1676,7 @@ def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
         "down_seconds": down_s,
         "maintenance_seconds": _dur(maint),
         "disabled_seconds": _dur(disabled_excluded) if disabled_mode == "exclude" else 0.0,
+        # Time removed from the calculation by per-outage operator exclusions.
         "excluded_seconds": _dur(user_excl),
         "nodata_seconds": _dur(nodata),
         "downtimes": downtimes,

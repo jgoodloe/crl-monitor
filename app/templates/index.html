@@ -121,6 +121,7 @@
   .dt-row { display:grid; grid-template-columns: 150px 80px 1fr; gap: 8px; padding: 6px 0;
     border-top: 1px dashed var(--border); align-items: start; }
   .dt-row.head { color: var(--muted); font-weight:600; border-top: 0; }
+  /* Dim an outage the operator has excluded from the uptime calculation. */
   .dt-row.dt-excluded { opacity: .55; }
   .dt-comment { display:flex; gap:6px; margin-top:4px; }
   .dt-comment input { padding: 5px 8px; }
@@ -261,6 +262,7 @@
     <div class="settings-row">
       <input type="checkbox" id="s_kuma"><label for="s_kuma" style="margin:0">Log Uptime Kuma pushes</label>
     </div>
+    <!-- Global toggle: show/hide the per-check result pills on the dashboard. -->
     <div class="settings-row">
       <input type="checkbox" id="s_pills"><label for="s_pills" style="margin:0">Show the tests that were run under each monitor</label>
     </div>
@@ -532,6 +534,7 @@ async function load() {
 function esc(s) { return (s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 function testPills(checks) {
+  // Honor the global "show the tests that were run" toggle (show_test_pills).
   if (!showTestPills || !checks || !checks.length) return '';
   const pills = checks.map(c =>
     `<span class="pill ${c.status}" title="${esc((c.label || c.key) + ': ' + (c.message || ''))}">${esc(SHORT_TEST[c.key] || c.key)}</span>`
@@ -836,6 +839,8 @@ async function runReport() {
 
 function downtimeRow(d, showMonitor) {
   const tag = d.excluded ? ' <span class="excluded-tag">(maintenance/disabled — excluded)</span>' : '';
+  // Operator-excluded outages are greyed out and labelled; the button toggles
+  // the persisted exclusion (see toggleOutage / PUT /history/{id}/exclude).
   const uex = d.user_excluded ? ' <span class="excluded-tag">(excluded from calculation)</span>' : '';
   const mon = showMonitor ? `<b>${esc(d.cert_alias)}</b> · ` : '';
   const btn = d.user_excluded ? 'Re-include' : 'Exclude';
@@ -851,6 +856,8 @@ function downtimeRow(d, showMonitor) {
     </span></div>`;
 }
 
+// Exclude or re-include a single outage in the uptime calculation. The choice
+// is persisted server-side, so re-running/re-opening the report keeps it.
 async function toggleOutage(hid, currentlyExcluded) {
   const res = await mutate(API('/history/' + hid + '/exclude'), 'PUT',
     { excluded: !currentlyExcluded });
