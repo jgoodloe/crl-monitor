@@ -363,6 +363,26 @@ and drives the check engine end to end (valid, revoked, bad signature, stale,
 unreachable). `tests/test_security.py` guards the SSRF egress controls,
 IP-pinned fetch, CSRF requirement, and XSS-safe rendering.
 
+## Versioning & releases
+
+This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+with a `v` prefix (`vMAJOR.MINOR.PATCH`, e.g. `v1.2.0`):
+
+- **MAJOR** — breaking changes
+- **MINOR** — new backward-compatible features
+- **PATCH** — backward-compatible bug fixes
+
+Commits use [Conventional Commits](https://www.conventionalcommits.org/)
+(`feat:` → minor, `fix:` → patch, `feat!:` / `BREAKING CHANGE:` → major;
+`chore:`, `docs:`, `refactor:`, `test:`, `ci:` carry no version bump). Notable
+changes are recorded in [CHANGELOG.md](CHANGELOG.md) in
+[Keep a Changelog](https://keepachangelog.com/) format (Added / Changed / Fixed
+/ Removed).
+
+Releases are cut by tagging an annotated `vX.Y.Z` tag on `main`. Pushing the tag
+builds and publishes the Docker image to GHCR tagged with both the version
+(`:vX.Y.Z`) and `:latest`.
+
 ## Notes
 
 - Run with a **single** gunicorn worker (the Dockerfile does this) so the
