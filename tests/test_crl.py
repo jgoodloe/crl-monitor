@@ -520,6 +520,27 @@ def test_run_crl_check_captures_issuer_and_revoked_count(m, monkeypatch):
     assert res.crl_issuer and "CN=" in res.crl_issuer
 
 
+def test_kuma_message_carries_crl_history_fields(m, monkeypatch):
+    """The Uptime Kuma push message includes the same CRL metadata captured for
+    the CRL Data history: CA, CRL number, revoked count, time remaining, and
+    next update; it falls back to the status summary when none is available."""
+    ca_key, ca = _make_ca()
+    leaf = _make_leaf(ca_key, ca)
+    crl = _make_crl(ca_key, ca, revoked_serials=[1, 2], crl_number=42)
+    _stub_download(m, monkeypatch, crl)
+    res = m.run_crl_check(_pem(leaf), _pem(ca), "http://crl.test/ca.crl", DEFAULTS)
+
+    msg = m._kuma_message(res)
+    assert "CA=Test CA" in msg
+    assert "CRL#=42" in msg
+    assert "revoked=2" in msg
+    assert "remaining=" in msg
+    assert "nextUpdate=" in msg
+
+    # No parsed CRL (e.g. failure) -> just the status summary, no trailing meta.
+    assert m._kuma_message(m.CRLResult("Error", "boom")) == "boom"
+
+
 def test_freshest_crl_urls_extraction(m):
     ca_key, ca = _make_ca()
     base = _make_crl(ca_key, ca, crl_number=10, freshest="http://crl.test/delta.crl")

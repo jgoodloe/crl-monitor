@@ -8,6 +8,12 @@ with a `v` prefix (e.g. `v1.2.0`).
 
 ## [Unreleased]
 
+### Changed
+- Uptime Kuma push messages now include the CRL metadata captured for the CRL
+  Data history — issuing CA, CRL number, revoked count, time remaining, and next
+  update — appended to the status summary (falls back to the summary alone when
+  no CRL was parsed).
+
 ## [v1.0.0] - 2026-06-17
 
 Initial release of **CRL Monitor** — a single-container monitor for

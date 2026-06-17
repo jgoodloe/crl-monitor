@@ -17,6 +17,7 @@ revoked list.
 """
 
 import os
+import re
 import json
 import socket
 import ipaddress
@@ -1155,6 +1156,53 @@ def run_crl_check(cert_pem, issuer_pem, crl_uri, enabled_tests=None,
 # --------------------------------------------------------------------------- #
 # Uptime Kuma passive push
 # --------------------------------------------------------------------------- #
+def _kuma_cn(dn):
+    """The CN (or first RDN) of a CRL issuer DN, for compact display — mirrors
+    the dashboard's crlIssuerCN()."""
+    if not dn:
+        return None
+    m = re.search(r"CN=([^,]+)", dn, re.IGNORECASE)
+    return (m.group(1) if m else dn.split(",")[0]).strip()
+
+
+def _format_remaining(next_update_iso, now=None):
+    """Human 'time remaining' until nextUpdate (e.g. '21h 10m', or '-5m' when
+    already past), or None when there is no nextUpdate. Matches the CRL Data
+    history's time-remaining presentation."""
+    nu = _parse_ts(next_update_iso)
+    if nu is None:
+        return None
+    secs = int((nu - (now or datetime.now(timezone.utc))).total_seconds())
+    sign, secs = ("-", -secs) if secs < 0 else ("", secs)
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    mnt = rem // 60
+    body = f"{d}d {h}h" if d else (f"{h}h {mnt}m" if h else f"{mnt}m")
+    return sign + body
+
+
+def _kuma_message(result):
+    """Compose the Uptime Kuma push message from the same CRL metadata captured
+    for the CRL Data history — issuing CA, CRL number, revoked count, time
+    remaining, and next update — appended to the status summary. Fields that are
+    unavailable (e.g. on a failed/unparsed CRL) are omitted."""
+    parts = []
+    cn = _kuma_cn(result.crl_issuer)
+    if cn:
+        parts.append(f"CA={cn}")
+    if result.crl_number is not None:
+        parts.append(f"CRL#={result.crl_number}")
+    if result.revoked_count is not None:
+        parts.append(f"revoked={result.revoked_count}")
+    rem = _format_remaining(result.next_update)
+    if rem is not None:
+        parts.append(f"remaining={rem}")
+    if result.next_update:
+        parts.append(f"nextUpdate={result.next_update}")
+    meta = "; ".join(parts)
+    return f"{result.message} — {meta}" if meta else result.message
+
+
 def push_to_uptime_kuma(url, status, message, logging_enabled=True):
     if not url or not url.strip():
         return
@@ -1410,7 +1458,10 @@ def check_monitor(db, row):
     if not log_only_failures or result.status != "Valid":
         log.info("[Worker] '%s' -> %s (%s ms)", alias, result.status, result.response_ms)
 
-    push_to_uptime_kuma(row["uptime_kuma_url"], result.status, result.message, kuma_logging)
+    # Push the CRL metadata (CA, CRL number, revoked count, time remaining,
+    # next update) — the same data captured for the CRL Data history.
+    push_to_uptime_kuma(row["uptime_kuma_url"], result.status,
+                        _kuma_message(result), kuma_logging)
     return result
 
 
