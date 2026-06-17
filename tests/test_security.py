@@ -331,6 +331,69 @@ def test_monitor_retry_min_round_trips(m):
     assert client.get(f"/api/monitors/{rid}").get_json()["retry_min"] == 3
 
 
+def test_show_test_pills_setting_round_trips(m):
+    """The dashboard 'show tests that were run' toggle is exposed, defaults on,
+    and persists, and the template gates the pills on it."""
+    client = m.app.test_client()
+    s = client.get("/api/settings").get_json()
+    assert s.get("show_test_pills") is True  # default on
+
+    r = client.put("/api/settings", json={"show_test_pills": False}, headers=_csrf())
+    assert r.status_code == 200
+    assert r.get_json()["show_test_pills"] is False
+    assert client.get("/api/settings").get_json()["show_test_pills"] is False
+
+    html = open(TEMPLATE_PATH, encoding="utf-8").read()
+    assert "if (!showTestPills" in html  # pills gated on the toggle
+
+
+def test_outage_exclusion_persists_and_affects_uptime(m):
+    """An outage can be excluded from (and re-included in) the uptime
+    calculation, and the choice is persisted on the history row."""
+    from contextlib import closing
+    from datetime import datetime, timedelta, timezone
+    client = m.app.test_client()
+    rid = _make_monitor(client)
+    now = datetime.now(timezone.utc)
+
+    # A bounded Error outage [now-2h, now-1h] between Valid spans.
+    with closing(m.raw_db()) as db:
+        for status, dt in (("Valid", now - timedelta(hours=4)),
+                           ("Error", now - timedelta(hours=2)),
+                           ("Valid", now - timedelta(hours=1))):
+            db.execute(
+                "INSERT INTO history (monitor_id, status, message, timestamp) "
+                "VALUES (?,?,?,?)", (rid, status, "x", dt.isoformat()))
+        db.commit()
+        hid = db.execute(
+            "SELECT id FROM history WHERE monitor_id=? AND status='Error'",
+            (rid,)).fetchone()["id"]
+
+    qs = (f"?from={(now - timedelta(hours=3)).isoformat()}"
+          f"&to={now.isoformat()}&monitor_ids={rid}")
+
+    rep = client.get("/api/reports/uptime" + qs).get_json()["monitors"][0]
+    assert rep["down_seconds"] > 0
+    assert rep["uptime_pct"] < 100
+
+    # Exclude the outage -> dropped from the calculation, persisted on the row.
+    r = client.put(f"/api/history/{hid}/exclude", json={"excluded": True},
+                   headers=_csrf())
+    assert r.status_code == 200 and r.get_json()["uptime_excluded"] is True
+
+    rep = client.get("/api/reports/uptime" + qs).get_json()["monitors"][0]
+    assert rep["down_seconds"] == 0
+    assert rep["excluded_seconds"] > 0
+    assert rep["uptime_pct"] == 100
+    # The downtime is still listed, flagged as user-excluded.
+    assert rep["downtimes"][0]["user_excluded"] is True
+
+    # Re-include -> back to counting against uptime.
+    client.put(f"/api/history/{hid}/exclude", json={"excluded": False}, headers=_csrf())
+    rep = client.get("/api/reports/uptime" + qs).get_json()["monitors"][0]
+    assert rep["down_seconds"] > 0 and rep["uptime_pct"] < 100
+
+
 def test_crl_data_endpoint_returns_snapshots(m):
     client = m.app.test_client()
     rid = _make_monitor(client)  # dummy PEM -> the check errors, but still snapshots

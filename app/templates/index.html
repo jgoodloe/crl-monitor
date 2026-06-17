@@ -121,6 +121,7 @@
   .dt-row { display:grid; grid-template-columns: 150px 80px 1fr; gap: 8px; padding: 6px 0;
     border-top: 1px dashed var(--border); align-items: start; }
   .dt-row.head { color: var(--muted); font-weight:600; border-top: 0; }
+  .dt-row.dt-excluded { opacity: .55; }
   .dt-comment { display:flex; gap:6px; margin-top:4px; }
   .dt-comment input { padding: 5px 8px; }
   .excluded-tag { color: var(--muted); font-size: 11px; }
@@ -260,6 +261,9 @@
     <div class="settings-row">
       <input type="checkbox" id="s_kuma"><label for="s_kuma" style="margin:0">Log Uptime Kuma pushes</label>
     </div>
+    <div class="settings-row">
+      <input type="checkbox" id="s_pills"><label for="s_pills" style="margin:0">Show the tests that were run under each monitor</label>
+    </div>
     <label style="margin-top:16px">Default verification tests</label>
     <div class="muted small" style="margin-bottom:6px">
       Applied to any monitor set to “Use the global default set”.
@@ -396,6 +400,7 @@ function mutate(url, method, body) {
 let editingId = null;
 let AVAILABLE_TESTS = [];          // [{key,label}] from /api/tests
 let globalDefaultTests = [];       // current global default set
+let showTestPills = true;          // global toggle for the per-check pills
 let MONITORS = [];                 // last-loaded monitor rows, by reference
 
 // Look up an alias by id rather than threading attacker-controlled text through
@@ -527,7 +532,7 @@ async function load() {
 function esc(s) { return (s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 function testPills(checks) {
-  if (!checks || !checks.length) return '';
+  if (!showTestPills || !checks || !checks.length) return '';
   const pills = checks.map(c =>
     `<span class="pill ${c.status}" title="${esc((c.label || c.key) + ': ' + (c.message || ''))}">${esc(SHORT_TEST[c.key] || c.key)}</span>`
   ).join('');
@@ -702,6 +707,7 @@ async function openSettings() {
   document.getElementById('s_debug').checked = !!s.debug_logging;
   document.getElementById('s_failures').checked = !!s.log_only_failures;
   document.getElementById('s_kuma').checked = !!s.uptime_kuma_logging;
+  document.getElementById('s_pills').checked = (s.show_test_pills !== false);
   globalDefaultTests = s.default_tests || [];
   renderTestChecks('s_tests_box', 's_t_', globalDefaultTests);
   document.getElementById('s_resptime').value = s.default_response_time_ms || '';
@@ -726,6 +732,7 @@ async function saveSettings() {
     debug_logging: document.getElementById('s_debug').checked,
     log_only_failures: document.getElementById('s_failures').checked,
     uptime_kuma_logging: document.getElementById('s_kuma').checked,
+    show_test_pills: document.getElementById('s_pills').checked,
     default_tests: selectedTests('s_tests_box'),
     default_response_time_ms: parseInt(document.getElementById('s_resptime').value) || 5000,
     default_schedule_mode: document.getElementById('s_sched').value || 'frequency',
@@ -749,7 +756,8 @@ async function saveSettings() {
     max_crl_bytes: (parseInt(document.getElementById('s_maxcrl').value) || 16) * 1024 * 1024,
   });
   globalDefaultTests = selectedTests('s_tests_box');
-  closeSettings(); flash('Settings saved.');
+  showTestPills = document.getElementById('s_pills').checked;
+  closeSettings(); flash('Settings saved.'); load();
 }
 
 // ---- Reports ----
@@ -828,16 +836,26 @@ async function runReport() {
 
 function downtimeRow(d, showMonitor) {
   const tag = d.excluded ? ' <span class="excluded-tag">(maintenance/disabled — excluded)</span>' : '';
+  const uex = d.user_excluded ? ' <span class="excluded-tag">(excluded from calculation)</span>' : '';
   const mon = showMonitor ? `<b>${esc(d.cert_alias)}</b> · ` : '';
-  return `<div class="dt-row">
+  const btn = d.user_excluded ? 'Re-include' : 'Exclude';
+  return `<div class="dt-row${d.user_excluded ? ' dt-excluded' : ''}">
     <span class="small">${fmt(d.start)}</span>
     <span class="small">${fmtDur(d.duration_s)}</span>
-    <span><span class="badge ${d.status}">${d.status}</span> ${mon}${esc(d.reason || '')}${tag}
+    <span><span class="badge ${d.status}">${d.status}</span> ${mon}${esc(d.reason || '')}${tag}${uex}
       <div class="dt-comment">
         <input type="text" id="cmt_${d.hist_id}" placeholder="Add a comment…" value="${esc(d.comment || '')}">
         <button class="secondary tiny" onclick="saveComment(${d.hist_id})">Save</button>
+        <button class="secondary tiny" onclick="toggleOutage(${d.hist_id}, ${d.user_excluded ? 'true' : 'false'})">${btn}</button>
       </div>
     </span></div>`;
+}
+
+async function toggleOutage(hid, currentlyExcluded) {
+  const res = await mutate(API('/history/' + hid + '/exclude'), 'PUT',
+    { excluded: !currentlyExcluded });
+  if (res.ok) { flash(currentlyExcluded ? 'Outage re-included.' : 'Outage excluded.'); runReport(); }
+  else flash('Update failed.');
 }
 
 function renderUptime(data) {
@@ -853,7 +871,7 @@ function renderUptime(data) {
     return `<div class="uptime-card">
       <div class="uptime-head"><b>${esc(r.cert_alias)}</b><span class="uptime-pct">${pct}</span></div>
       <div class="bar"><span style="width:${w}%"></span></div>
-      <div class="muted small">up ${fmtDur(r.up_seconds)} · down ${fmtDur(r.down_seconds)} · maintenance ${fmtDur(r.maintenance_seconds)} · disabled ${fmtDur(r.disabled_seconds)} · no-data ${fmtDur(r.nodata_seconds)}</div>
+      <div class="muted small">up ${fmtDur(r.up_seconds)} · down ${fmtDur(r.down_seconds)} · maintenance ${fmtDur(r.maintenance_seconds)} · disabled ${fmtDur(r.disabled_seconds)}${r.excluded_seconds ? ' · excluded ' + fmtDur(r.excluded_seconds) : ''} · no-data ${fmtDur(r.nodata_seconds)}</div>
       ${dts}</div>`;
   }).join('');
 }
@@ -917,9 +935,13 @@ document.querySelectorAll('.overlay').forEach(o =>
 
 async function init() {
   await loadTests();
-  // Preload the global default so the Add form shows it before Settings is opened.
-  try { globalDefaultTests = (await (await fetch(API('/settings'))).json()).default_tests || []; }
-  catch (e) { globalDefaultTests = []; }
+  // Preload global settings so the Add form and dashboard reflect them before
+  // the Settings modal is ever opened.
+  try {
+    const s = await (await fetch(API('/settings'))).json();
+    globalDefaultTests = s.default_tests || [];
+    showTestPills = (s.show_test_pills !== false);
+  } catch (e) { globalDefaultTests = []; }
   load();
 }
 init();

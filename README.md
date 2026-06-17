@@ -221,9 +221,12 @@ Open **Reports** in the toolbar. Pick a time frame (quick ranges or custom
 from/to) and, optionally, specific monitors (none selected = all). Three views:
 
 - **Uptime** — per-monitor uptime %, with a breakdown of up / down / maintenance
-  / disabled / no-data time, and the list of downtimes in range. Each downtime
-  shows the **reason** and an editable **comment** stored on the status-change
-  event for future reports.
+  / disabled / excluded / no-data time, and the list of downtimes in range. Each
+  downtime shows the **reason** and an editable **comment** stored on the
+  status-change event for future reports. Each downtime also has an
+  **Exclude / Re-include** button that drops (or restores) that single outage
+  from the uptime calculation; the choice is persisted on the status-change row,
+  so it carries across future reports.
 - **All downtimes** — a single chronological list of every downtime across the
   selected monitors for the period.
 - **Maintenance windows** — define windows (per monitor or for all monitors)
@@ -239,6 +242,10 @@ chosen *at report time*:
   *ignored* (use whatever status was last recorded).
 - **Exclude maintenance** — whether maintenance-window time is removed from
   totals (downtimes inside a window are shown but flagged as excluded).
+
+Individually **excluded** outages (via each downtime's Exclude button) are
+dropped from the calculation regardless of the options above and are flagged
+in the list; the excluded time is surfaced in the per-monitor breakdown.
 
 ## Selectable verification tests
 
@@ -285,7 +292,9 @@ Selection works at two levels:
 The dashboard shows a coloured pill per test on each monitor's row (green =
 pass, red = fail, grey = skipped), and the overall status reflects only the
 tests you enabled — e.g. disabling **Certificate revocation status** means a
-revoked cert won't flip the monitor to `Revoked`.
+revoked cert won't flip the monitor to `Revoked`. These per-check pills can be
+hidden globally with **Settings → Show the tests that were run** (the
+`show_test_pills` setting; on by default).
 
 > **Note:** This tool is aimed at PKIs where CRLs are published and required —
 > e.g. federal PIV/PIV-I — and works against any HTTP(S)-published RFC 5280 CRL.
@@ -309,6 +318,7 @@ All endpoints are under `<prefix>/api`:
 | GET | `/api/monitors/{id}/crl-data?limit=N` | Captured CRL-metadata snapshots over time (newest first). |
 | GET | `/api/monitors/{id}/audit` | Enable/disable/create audit log. |
 | PUT | `/api/history/{id}` | Set/clear the comment on a status-change row. |
+| PUT | `/api/history/{id}/exclude` | Exclude/re-include that outage from uptime (`{"excluded": bool}`). |
 | GET/POST | `/api/maintenance` | List / create maintenance windows. |
 | DELETE | `/api/maintenance/{id}` | Delete a maintenance window. |
 | GET | `/api/reports/uptime` | Per-monitor uptime + downtimes for a window. |

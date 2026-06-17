@@ -243,6 +243,7 @@ CREATE TABLE IF NOT EXISTS history (
     message      TEXT NOT NULL DEFAULT '',
     timestamp    TEXT NOT NULL,
     comment      TEXT,
+    uptime_excluded INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (monitor_id) REFERENCES monitors(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_history_monitor
@@ -322,6 +323,8 @@ DEFAULT_SETTINGS = {
     "retry_max_min": str(DEFAULT_RETRY_MAX_MIN),
     # How long (days) to retain captured CRL-metadata snapshots; 0 = forever.
     "crl_data_retention_days": str(DEFAULT_CRL_DATA_RETENTION_DAYS),
+    # UI: show the per-check result pills under each monitor's status message.
+    "show_test_pills": "true",
     # Maximum accepted CRL download size (bytes). Configurable at runtime so an
     # operator can raise it for large CRLs (e.g. some US-government CAs publish
     # CRLs of tens of MiB). Defaults to the MAX_CRL_BYTES env value.
@@ -373,6 +376,12 @@ def _migrate(db):
     ):
         if col not in snap_have:
             db.execute(ddl)
+
+    # history gained a per-outage "exclude from uptime" flag (reports).
+    hist_have = {r["name"] for r in db.execute("PRAGMA table_info(history)").fetchall()}
+    if "uptime_excluded" not in hist_have:
+        db.execute(
+            "ALTER TABLE history ADD COLUMN uptime_excluded INTEGER NOT NULL DEFAULT 0")
 
 
 def init_db():
@@ -1567,8 +1576,8 @@ def _maintenance_intervals(db, rid, win_start, win_end):
 def _status_segments(db, rid, win_start, win_end):
     """List of (start, end, row) over the window; row is None for no-data gaps."""
     rows = db.execute(
-        "SELECT id, status, message, timestamp, comment FROM history "
-        "WHERE monitor_id=? ORDER BY timestamp",
+        "SELECT id, status, message, timestamp, comment, uptime_excluded "
+        "FROM history WHERE monitor_id=? ORDER BY timestamp",
         (rid,),
     ).fetchall()
     seed, mids = None, []
@@ -1613,6 +1622,7 @@ def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
             downtimes.append({
                 "hist_id": row["id"], "status": row["status"],
                 "reason": row["message"], "comment": row["comment"],
+                "user_excluded": bool(row["uptime_excluded"]),
                 "_start": s, "_end": e,
             })
 
@@ -1634,6 +1644,16 @@ def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
         disabled_excluded = _subtract(disabled_excluded, maint)
         nodata = _subtract(nodata, maint)
 
+    # Operator-excluded individual outages are dropped from the calculation
+    # entirely (neither up nor down), like a maintenance window, and the choice
+    # is persisted (history.uptime_excluded) so it carries across reports.
+    user_excl = _merge([(d["_start"], d["_end"]) for d in downtimes
+                        if d["user_excluded"]])
+    if user_excl:
+        up, down = _subtract(up, user_excl), _subtract(down, user_excl)
+        disabled_excluded = _subtract(disabled_excluded, user_excl)
+        nodata = _subtract(nodata, user_excl)
+
     up_s, down_s = _dur(up), _dur(down)
     denom = up_s + down_s
     uptime_pct = round(100.0 * up_s / denom, 4) if denom > 0 else None
@@ -1652,6 +1672,7 @@ def compute_uptime(db, rid, win_start, win_end, down_mode="not_valid",
         "down_seconds": down_s,
         "maintenance_seconds": _dur(maint),
         "disabled_seconds": _dur(disabled_excluded) if disabled_mode == "exclude" else 0.0,
+        "excluded_seconds": _dur(user_excl),
         "nodata_seconds": _dur(nodata),
         "downtimes": downtimes,
     }
@@ -2125,6 +2146,20 @@ def update_history_comment(hid):
         "SELECT id, status, message, timestamp, comment FROM history WHERE id=?", (hid,)
     ).fetchone()
     return jsonify(dict(row))
+
+
+@app.route("/api/history/<int:hid>/exclude", methods=["PUT"])
+def update_history_exclude(hid):
+    """Exclude (or re-include) a single outage from the uptime calculation.
+    Persisted on the history row so the choice carries across future reports."""
+    data = request.get_json(silent=True) or {}
+    excluded = 1 if data.get("excluded") else 0
+    db = get_db()
+    cur = db.execute("UPDATE history SET uptime_excluded=? WHERE id=?", (excluded, hid))
+    db.commit()
+    if cur.rowcount == 0:
+        return jsonify({"message": "Not found"}), 404
+    return jsonify({"id": hid, "uptime_excluded": bool(excluded)})
 
 
 # ---- Maintenance windows ---- #
