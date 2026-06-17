@@ -8,11 +8,17 @@ with a `v` prefix (e.g. `v1.2.0`).
 
 ## [Unreleased]
 
+## [v1.1.0] - 2026-06-17
+
 ### Changed
 - Uptime Kuma push messages now include the CRL metadata captured for the CRL
   Data history — issuing CA, CRL number, revoked count, time remaining, and next
   update — appended to the status summary (falls back to the summary alone when
   no CRL was parsed).
+
+### Added
+- README screenshots (dashboard, uptime reports, add/edit monitor, CRL data
+  history, status history).
 
 ## [v1.0.0] - 2026-06-17
 
@@ -46,5 +52,6 @@ checks, uptime reporting, and CRL-metadata history.
 - Packaging: Docker image published to GHCR and a `docker-compose.yml` for a
   single-container deployment.
 
-[Unreleased]: https://github.com/jgoodloe/crl-monitor/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jgoodloe/crl-monitor/compare/v1.1.0...HEAD
+[v1.1.0]: https://github.com/jgoodloe/crl-monitor/compare/v1.0.0...v1.1.0
 [v1.0.0]: https://github.com/jgoodloe/crl-monitor/releases/tag/v1.0.0
