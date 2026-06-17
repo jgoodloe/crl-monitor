@@ -27,7 +27,7 @@ import time
 import logging
 from contextlib import closing
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 from flask import (
@@ -1207,6 +1207,27 @@ def _kuma_message(result):
     return f"{result.message} — {meta}" if meta else result.message
 
 
+def _normalize_kuma_url(url):
+    """Normalize an Uptime Kuma push URL so it works regardless of how it was
+    pasted (issue #14):
+
+      * Collapse repeated slashes in the path — Uptime Kuma sometimes emits
+        '.../api//push/...' or '...//api/push/...'; the extra slash 404s.
+      * Drop any status / msg / ping query params the user pasted in. The app
+        sets those itself when pushing, and duplicates would confuse Uptime
+        Kuma (e.g. two 'status' values, with the wrong one winning).
+
+    Any other query params are preserved. The result is the base push URL the
+    app then sends status/msg/ping to."""
+    if not url or not url.strip():
+        return url
+    p = urlsplit(url.strip())
+    path = re.sub(r"/{2,}", "/", p.path)
+    kept = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+            if k.lower() not in ("status", "msg", "ping")]
+    return urlunsplit((p.scheme, p.netloc, path, urlencode(kept), p.fragment))
+
+
 def push_to_uptime_kuma(url, status, message, logging_enabled=True):
     """Push a heartbeat to Uptime Kuma. Returns a short outcome token so callers
     can surface success/failure: None (no URL configured), 'ok' (200 {"ok":true}),
@@ -1214,6 +1235,8 @@ def push_to_uptime_kuma(url, status, message, logging_enabled=True):
     not acknowledged)."""
     if not url or not url.strip():
         return None
+    # Accept whatever push-URL format the user pasted; fix it before sending.
+    url = _normalize_kuma_url(url)
     # The push URL carries a secret token and is attacker-influenceable, so it
     # is subject to the same egress policy and is never logged in full.
     try:

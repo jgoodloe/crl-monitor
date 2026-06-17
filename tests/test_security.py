@@ -463,3 +463,56 @@ def test_check_persists_and_returns_kuma_push_outcome(m, monkeypatch):
     r = client.post(f"/api/monitors/{rid}/check", headers=_csrf())
     assert r.status_code == 200
     assert r.get_json()["last_kuma_push"] == "ok"
+
+
+def test_kuma_url_normalization(m):
+    """Any pasted push-URL format normalizes to the same base: '//api' collapses
+    to '/api', and status/msg/ping params are dropped (issue #14)."""
+    base = "https://status.goodloe.xyz/api/push/nSdq2sH78HSlfTmnHpDmak8H0dWPvPMF"
+    variants = [
+        base.replace("/api", "//api") + "?status=up&msg=OK&ping=",
+        base.replace("/api", "//api"),
+        base + "?status=up&msg=OK&ping=",
+        base,
+    ]
+    for v in variants:
+        assert m._normalize_kuma_url(v) == base, v
+    out = m._normalize_kuma_url(variants[0])
+    assert "//api" not in out
+    assert all(k not in out for k in ("status=", "msg=", "ping="))
+    # Unrelated query params are preserved.
+    assert m._normalize_kuma_url(base + "?foo=bar&status=down") == base + "?foo=bar"
+    # Empty / unset stays as-is.
+    assert m._normalize_kuma_url("") == ""
+
+
+def test_push_normalizes_url_and_sets_own_params(m, monkeypatch):
+    """The push uses the normalized URL and supplies its own status/msg/ping, so
+    user-pasted params can't duplicate or override them."""
+    seen, sent = {}, {}
+
+    def fake_validate(u):
+        seen["url"] = u
+        return ("h", "203.0.113.5")
+
+    class Resp:
+        status_code = 200
+        def json(self):
+            return {"ok": True}
+
+    def fake_req(method, url, host, ip, **kw):
+        sent["url"] = url
+        sent["params"] = kw.get("params")
+        return Resp()
+
+    monkeypatch.setattr(m, "validate_outbound_url", fake_validate)
+    monkeypatch.setattr(m, "_pinned_request", fake_req)
+
+    out = m.push_to_uptime_kuma(
+        "https://status.goodloe.xyz//api/push/TOK?status=up&msg=OK&ping=",
+        "Valid", "hello", False)
+
+    assert out == "ok"
+    assert seen["url"] == "https://status.goodloe.xyz/api/push/TOK"
+    assert sent["url"] == "https://status.goodloe.xyz/api/push/TOK"
+    assert sent["params"] == {"status": "up", "msg": "hello", "ping": ""}

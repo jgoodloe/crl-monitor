@@ -8,6 +8,12 @@ with a `v` prefix (e.g. `v1.2.0`).
 
 ## [Unreleased]
 
+### Fixed
+- Uptime Kuma push URLs are normalized before sending (#14): a repeated slash in
+  the path (e.g. `…//api/push/…`, which Uptime Kuma sometimes emits) is collapsed
+  to a single slash, and any `status`/`msg`/`ping` query params pasted into the
+  URL are dropped so they can't duplicate or override the values the app sends.
+
 ## [v1.1.1] - 2026-06-17
 
 ### Added
