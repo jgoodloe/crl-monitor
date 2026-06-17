@@ -415,3 +415,51 @@ def test_update_push_url_is_authoritative(m):
     # An explicit empty value clears it (what you see is what's saved).
     client.put(f"/api/monitors/{rid}", json={"uptime_kuma_url": ""}, headers=_csrf())
     assert client.get(f"/api/monitors/{rid}").get_json()["uptime_kuma_url"] == ""
+
+
+def test_kuma_push_reports_outcome(m, monkeypatch):
+    """push_to_uptime_kuma returns a token reflecting the real outcome: ok only
+    on 200 {"ok":true}, otherwise failed/error/blocked, and None with no URL."""
+    import requests
+
+    class Resp:
+        def __init__(self, code, body):
+            self.status_code, self._b = code, body
+        def json(self):
+            import json as _j
+            return _j.loads(self._b)
+
+    monkeypatch.setattr(m, "validate_outbound_url", lambda u: ("h", "203.0.113.5"))
+    url = "https://status.example.com/api/push/TOK"
+
+    monkeypatch.setattr(m, "_pinned_request", lambda *a, **k: Resp(200, '{"ok":true}'))
+    assert m.push_to_uptime_kuma(url, "Valid", "m", False) == "ok"
+
+    monkeypatch.setattr(m, "_pinned_request", lambda *a, **k: Resp(200, '{"ok":false}'))
+    assert m.push_to_uptime_kuma(url, "Valid", "m", False) == "failed"
+
+    monkeypatch.setattr(m, "_pinned_request", lambda *a, **k: Resp(404, 'nope'))
+    assert m.push_to_uptime_kuma(url, "Valid", "m", False) == "failed"
+
+    def boom(*a, **k):
+        raise requests.exceptions.ConnectionError("x")
+    monkeypatch.setattr(m, "_pinned_request", boom)
+    assert m.push_to_uptime_kuma(url, "Valid", "m", False) == "error"
+
+    def block(u):
+        raise m.UnsafeURLError("private")
+    monkeypatch.setattr(m, "validate_outbound_url", block)
+    assert m.push_to_uptime_kuma(url, "Valid", "m", False) == "blocked"
+
+    assert m.push_to_uptime_kuma("", "Valid", "m", False) is None
+
+
+def test_check_persists_and_returns_kuma_push_outcome(m, monkeypatch):
+    """A manual check records the push outcome on the monitor and returns it."""
+    monkeypatch.setattr(m, "push_to_uptime_kuma", lambda *a, **k: "ok")
+    client = m.app.test_client()
+    rid = _make_monitor(client,
+                        uptime_kuma_url="https://status.example.com/api/push/TOK")
+    r = client.post(f"/api/monitors/{rid}/check", headers=_csrf())
+    assert r.status_code == 200
+    assert r.get_json()["last_kuma_push"] == "ok"

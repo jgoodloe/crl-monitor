@@ -8,6 +8,12 @@ with a `v` prefix (e.g. `v1.2.0`).
 
 ## [Unreleased]
 
+### Added
+- Uptime Kuma push outcome is now recorded and surfaced: `push_to_uptime_kuma`
+  checks for the `{"ok":true}` acknowledgement and returns `ok` / `blocked` /
+  `error` / `failed`. The manual **Check** reports it, and each monitor row shows
+  the last push result (stored in `monitors.last_kuma_push`).
+
 ## [v1.1.0] - 2026-06-17
 
 ### Changed

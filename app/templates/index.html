@@ -513,7 +513,7 @@ async function load() {
       tr.innerHTML = `
         <td><b>${esc(r.cert_alias)}</b>${r.enabled ? '' : ' <span class="muted small">(disabled)</span>'}</td>
         <td><span class="badge ${r.status}">${r.status}</span></td>
-        <td class="muted small">${esc(r.last_message || '')}${testPills(r.last_checks)}</td>
+        <td class="muted small">${esc(r.last_message || '')}${testPills(r.last_checks)}${kumaRowTag(r)}</td>
         <td class="small">${r.response_ms != null ? r.response_ms + ' ms' : '—'}</td>
         <td class="small">${fmt(r.next_update)}</td>
         <td class="small">${fmt(r.last_run)}</td>
@@ -648,11 +648,29 @@ async function delRow(id) {
   flash(res.ok ? 'Deleted.' : 'Delete failed.'); load();
 }
 
+// Human label for an Uptime Kuma push outcome token from the API.
+function kumaLabel(s) {
+  return ({ ok: 'Uptime Kuma: pushed ✓',
+            blocked: 'Uptime Kuma: blocked by egress policy',
+            error: 'Uptime Kuma: network error',
+            failed: 'Uptime Kuma: not acknowledged' })[s] || '';
+}
+// Persistent per-row indicator of the last Uptime Kuma push (only when a URL
+// is configured, i.e. last_kuma_push is set).
+function kumaRowTag(r) {
+  if (!r.last_kuma_push) return '';
+  const color = r.last_kuma_push === 'ok' ? 'var(--good)' : 'var(--warn)';
+  return `<div class="small" style="margin-top:4px;color:${color}">${esc(kumaLabel(r.last_kuma_push))}</div>`;
+}
+
 async function checkNow(id) {
   flash('Checking…');
   try {
     const res = await mutate(API('/monitors/' + id + '/check'), 'POST');
-    flash(res.ok ? 'Check complete.' : (res.status === 429 ? 'Rate limited — slow down.' : 'Check failed.'));
+    if (!res.ok) { flash(res.status === 429 ? 'Rate limited — slow down.' : 'Check failed.'); return; }
+    const mon = await res.json().catch(() => null);
+    const k = mon && mon.last_kuma_push ? ' · ' + kumaLabel(mon.last_kuma_push) : '';
+    flash('Check complete.' + k);
     load();
   } catch (e) { flash('Check failed: ' + e.message); }
 }

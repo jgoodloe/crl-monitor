@@ -233,6 +233,9 @@ CREATE TABLE IF NOT EXISTS monitors (
     response_ms     INTEGER,
     this_update     TEXT,
     next_update     TEXT,
+    -- Outcome of the most recent Uptime Kuma push: ok | blocked | error |
+    -- failed, or NULL when no push URL is configured.
+    last_kuma_push  TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -366,6 +369,7 @@ def _migrate(db):
         ("retry_min", "ALTER TABLE monitors ADD COLUMN retry_min INTEGER"),
         ("consecutive_failures",
          "ALTER TABLE monitors ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"),
+        ("last_kuma_push", "ALTER TABLE monitors ADD COLUMN last_kuma_push TEXT"),
     ):
         if col not in have:
             db.execute(ddl)
@@ -1204,20 +1208,24 @@ def _kuma_message(result):
 
 
 def push_to_uptime_kuma(url, status, message, logging_enabled=True):
+    """Push a heartbeat to Uptime Kuma. Returns a short outcome token so callers
+    can surface success/failure: None (no URL configured), 'ok' (200 {"ok":true}),
+    'blocked' (egress policy), 'error' (network failure), or 'failed' (reached but
+    not acknowledged)."""
     if not url or not url.strip():
-        return
+        return None
     # The push URL carries a secret token and is attacker-influenceable, so it
     # is subject to the same egress policy and is never logged in full.
     try:
         pin_host, pin_ip = validate_outbound_url(url)
     except UnsafeURLError as e:
         log.warning("[UptimeKuma] push URL blocked by egress policy: %s", e)
-        return
+        return "blocked"
     kuma_status = "up" if status == "Valid" else "down"
     try:
         if logging_enabled:
             log.info("[UptimeKuma] push status=%s msg=%s", kuma_status, message)
-        _pinned_request(
+        resp = _pinned_request(
             "GET", url, pin_host, pin_ip,
             params={"status": kuma_status, "msg": message, "ping": ""},
             timeout=5,
@@ -1226,6 +1234,19 @@ def push_to_uptime_kuma(url, status, message, logging_enabled=True):
     except requests.exceptions.RequestException:
         # Don't log the exception — it can contain the full URL (token).
         log.warning("[UptimeKuma] push failed (network error).")
+        return "error"
+    # Uptime Kuma answers HTTP 200 with {"ok":true} on success.
+    try:
+        ok = resp.status_code == 200 and bool(resp.json().get("ok"))
+    except ValueError:
+        ok = False
+    if ok:
+        if logging_enabled:
+            log.info("[UptimeKuma] push acknowledged (ok).")
+        return "ok"
+    # Log the status code only (never the URL/token).
+    log.warning("[UptimeKuma] push not acknowledged (HTTP %s).", resp.status_code)
+    return "failed"
 
 
 # --------------------------------------------------------------------------- #
@@ -1459,9 +1480,13 @@ def check_monitor(db, row):
         log.info("[Worker] '%s' -> %s (%s ms)", alias, result.status, result.response_ms)
 
     # Push the CRL metadata (CA, CRL number, revoked count, time remaining,
-    # next update) — the same data captured for the CRL Data history.
-    push_to_uptime_kuma(row["uptime_kuma_url"], result.status,
-                        _kuma_message(result), kuma_logging)
+    # next update) — the same data captured for the CRL Data history — and
+    # record the push outcome so it can be surfaced in the UI / check response.
+    kuma_result = push_to_uptime_kuma(row["uptime_kuma_url"], result.status,
+                                      _kuma_message(result), kuma_logging)
+    db.execute("UPDATE monitors SET last_kuma_push=? WHERE id=?", (kuma_result, rid))
+    db.commit()
+    result.kuma_push = kuma_result
     return result
 
 
@@ -1866,6 +1891,10 @@ def monitor_to_dict(row, include_pem=True):
         "last_crl_number": (row["last_crl_number"]
                             if "last_crl_number" in row.keys() else None),
         "last_checks": _load_checks(row["last_checks"] if "last_checks" in row.keys() else None),
+        # Outcome of the most recent Uptime Kuma push (ok|blocked|error|failed),
+        # or None when no push URL is configured.
+        "last_kuma_push": (row["last_kuma_push"]
+                           if "last_kuma_push" in row.keys() else None),
         "last_run": row["last_run"],
         "next_run": row["next_run"],
         "status": row["status"],
