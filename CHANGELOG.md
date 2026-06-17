@@ -8,6 +8,8 @@ with a `v` prefix (e.g. `v1.2.0`).
 
 ## [Unreleased]
 
+## [v1.1.2] - 2026-06-17
+
 ### Fixed
 - Uptime Kuma push URLs are normalized before sending (#14): a repeated slash in
   the path (e.g. `…//api/push/…`, which Uptime Kuma sometimes emits) is collapsed
@@ -66,7 +68,8 @@ checks, uptime reporting, and CRL-metadata history.
 - Packaging: Docker image published to GHCR and a `docker-compose.yml` for a
   single-container deployment.
 
-[Unreleased]: https://github.com/jgoodloe/crl-monitor/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/jgoodloe/crl-monitor/compare/v1.1.2...HEAD
+[v1.1.2]: https://github.com/jgoodloe/crl-monitor/compare/v1.1.1...v1.1.2
 [v1.1.1]: https://github.com/jgoodloe/crl-monitor/compare/v1.1.0...v1.1.1
 [v1.1.0]: https://github.com/jgoodloe/crl-monitor/compare/v1.0.0...v1.1.0
 [v1.0.0]: https://github.com/jgoodloe/crl-monitor/releases/tag/v1.0.0
