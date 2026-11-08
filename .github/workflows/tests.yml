@@ -2,8 +2,11 @@ name: Tests
 
 on:
   pull_request:
-  push:
-    branches: [main]
+  # Callable as a reusable workflow so the release pipeline (docker-publish.yml)
+  # can gate publishing on these tests. Direct pushes to main are covered by the
+  # release pipeline calling this, so there's no standalone push trigger here
+  # (avoids running pytest twice for the same commit).
+  workflow_call:
 
 jobs:
   pytest:

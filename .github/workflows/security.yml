@@ -1,0 +1,115 @@
+# CVE / dependency security scan.
+#
+# Gate policy (decided with the maintainer):
+#   * FAIL the build only on HIGH/CRITICAL vulnerabilities that have a fix
+#     available (Trivy with --ignore-unfixed). Those are actionable now: bump
+#     the dependency / base image and the problem is gone.
+#   * Everything else (unfixable, or MEDIUM/LOW) is reported but does NOT fail
+#     the build. On the scheduled run these open/append a tracking issue so the
+#     maintainer can judge them — "alert me, I decide."
+#
+# Runs on PRs, on a daily schedule, on demand, and as a reusable workflow that
+# the release pipeline calls so nothing publishes without passing this gate.
+name: Security scan
+
+on:
+  pull_request:
+  schedule:
+    # Daily at 06:17 UTC. Catches newly disclosed advisories against the pinned
+    # dependencies even when nothing in the repo changed.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  cve-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write   # only used on the scheduled run, to open an alert issue
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # pip-audit has the richest PyPI advisory database. Informational only
+      # (never fails the build); the Trivy step below is the gate.
+      - name: pip-audit (informational)
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt -r requirements-dev.txt --desc on || true
+
+      # THE GATE: fail only on fixable HIGH/CRITICAL in Python deps / lockfiles.
+      - name: Trivy gate — fixable HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+          output: trivy-gate.txt
+
+      # Full picture (all severities incl. unfixable). Never fails — this is the
+      # "you decide" surface, surfaced in the step summary.
+      - name: Trivy full report (informational)
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "0"
+          format: table
+          output: trivy-full.txt
+
+      - name: Attach reports to the run summary
+        if: always()
+        run: |
+          {
+            echo "## Trivy — fixable HIGH/CRITICAL (gate)"
+            echo '```'; cat trivy-gate.txt 2>/dev/null || echo "(no report)"; echo '```'
+            echo "## Trivy — full report (informational)"
+            echo '```'; cat trivy-full.txt 2>/dev/null || echo "(no report)"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # On the DAILY scan only: if the gate failed, a fixable HIGH/CRITICAL was
+      # disclosed against the current pinned deps — alert the maintainer. (On PRs
+      # the failed check is the alert; no issue spam.) Dedupes onto one open
+      # issue labelled `security-alert`.
+      - name: Alert on scheduled scan failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create security-alert --repo "$GITHUB_REPOSITORY" \
+            --color B60205 --description "Automated CVE scan alert" 2>/dev/null || true
+          {
+            echo "The scheduled CVE scan found a **HIGH/CRITICAL vulnerability with a fix available**"
+            echo "in a pinned dependency. A patched version exists, so bumping it (Dependabot may have"
+            echo "already opened a PR) and letting the gated build republish will clear it."
+            echo
+            echo '```'
+            cat trivy-gate.txt 2>/dev/null || echo "(report unavailable)"
+            echo '```'
+            echo
+            echo "_Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}_"
+          } > alert-body.md
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label security-alert --json number --jq '.[0].number' 2>/dev/null)"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file alert-body.md
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "🚨 Security scan: fixable HIGH/CRITICAL vulnerability detected" \
+              --label security-alert --body-file alert-body.md
+          fi

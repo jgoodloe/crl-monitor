@@ -1,12 +1,46 @@
+# Release pipeline: build and publish the container image to GHCR — but only
+# after everything passes. Nothing is published unless, in order:
+#   1. tests      — the pytest suite passes (reusable tests.yml)
+#   2. security   — the CVE gate passes: no fixable HIGH/CRITICAL in deps
+#                   (reusable security.yml)
+#   3. the image is built AND scanned — the built image has no fixable
+#      HIGH/CRITICAL (base-image + OS packages), checked BEFORE the push
+#
+# Publishing is fully automatic once all of the above are green (no manual
+# approval gate). A failure at any stage means no image is pushed for that
+# commit/tag.
+#
+# Triggers (this is the answer to "what triggers the build"):
+#   * push to main        -> rebuild + republish the rolling :latest image.
+#     Dependabot security/auto-merge PRs land on main, so a patched dependency
+#     flows straight through this gated rebuild and the vulnerable image is
+#     replaced automatically.
+#   * push of a vX.Y.Z tag -> publish that version plus :latest (a release).
 name: Build and publish Docker image
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ["v*"]
+
+permissions:
+  contents: read
 
 jobs:
+  # Gate 1 — tests must pass.
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  # Gate 2 — dependency CVE scan must pass (fixable HIGH/CRITICAL fails it).
+  security:
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+      issues: write
+
+  # Gate 3 — build the image, scan it, and only then publish.
   build-and-push:
+    needs: [tests, security]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -14,6 +48,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -33,10 +70,37 @@ jobs:
             type=semver,pattern=v{{version}}
             type=raw,value=latest
 
-      - name: Build and push
+      # Build and load into the local daemon (no push yet) so the exact image
+      # that would ship can be scanned first. gha cache makes the later push
+      # a cache hit rather than a second full build.
+      - name: Build image (load locally, do not push yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Gate 3 — scan the built image (base image + OS packages). Fail on
+      # fixable HIGH/CRITICAL BEFORE anything is published.
+      - name: Trivy gate — scan built image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ghcr.io/jgoodloe/crl-monitor:latest
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      # Reached only when tests + dep scan + image scan all passed.
+      - name: Push image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
