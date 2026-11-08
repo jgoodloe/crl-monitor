@@ -48,7 +48,7 @@ jobs:
 
       # THE GATE: fail only on fixable HIGH/CRITICAL in Python deps / lockfiles.
       - name: Trivy gate — fixable HIGH/CRITICAL
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -62,7 +62,7 @@ jobs:
       # "you decide" surface, surfaced in the step summary.
       - name: Trivy full report (informational)
         if: always()
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           scan-type: fs
           scan-ref: .

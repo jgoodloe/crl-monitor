@@ -86,7 +86,7 @@ jobs:
       # Gate 3 — scan the built image (base image + OS packages). Fail on
       # fixable HIGH/CRITICAL BEFORE anything is published.
       - name: Trivy gate — scan built image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           scan-type: image
           image-ref: ghcr.io/jgoodloe/crl-monitor:latest
