@@ -74,7 +74,7 @@ jobs:
       # that would ship can be scanned first. gha cache makes the later push
       # a cache hit rather than a second full build.
       - name: Build image (load locally, do not push yet)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           load: true
@@ -97,7 +97,7 @@ jobs:
 
       # Reached only when tests + dep scan + image scan all passed.
       - name: Push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
