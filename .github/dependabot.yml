@@ -1,0 +1,53 @@
+# Dependabot keeps dependencies current by opening (and re-opening) update PRs
+# on a schedule. The companion workflow dependabot-auto-merge.yml auto-approves
+# and merges patch/minor updates once CI passes; major-version bumps are left
+# open for manual review (that's where breaking changes live).
+#
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  # --- Python packages (requirements.txt / requirements-dev.txt) ------------ #
+  # This is where the security fixes land (cryptography, requests, Flask, …).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    # Collapse routine runtime-dep bumps into one PR to cut review noise; a
+    # major version still breaks out into its own PR (see auto-merge workflow).
+    groups:
+      python-runtime:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # --- Dockerfile base image (python:3.12-slim) ----------------------------- #
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+
+  # --- GitHub Actions used by the workflows --------------------------------- #
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
