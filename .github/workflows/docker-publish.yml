@@ -63,7 +63,7 @@ jobs:
       # :latest; a push to main produces :latest (rolling).
       - name: Derive image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/jgoodloe/crl-monitor
           tags: |
