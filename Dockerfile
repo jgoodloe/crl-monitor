@@ -10,8 +10,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# curl is only for the container HEALTHCHECK.
+# Patch the base image's OS packages to the latest security fixes available at
+# build time (clears fixable CVEs the slim base ships with, e.g. zlib1g), then
+# install curl for the container HEALTHCHECK. The release image CVE gate scans
+# for fixable CRITICAL/HIGH, so keeping this upgrade step is what lets a tagged
+# release publish; Dependabot's weekly base-image bump keeps the floor moving.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 

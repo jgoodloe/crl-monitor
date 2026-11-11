@@ -1,0 +1,43 @@
+# One-click release, stage 2 of 2: when a "Prepare release vX.Y.Z" commit (from
+# release-cut.yml) lands on main, push the matching tag so the existing build
+# pipeline (docker-publish.yml, triggered on v* tags) ships the image and the
+# GitHub Release.
+#
+# Why a PAT: refs created with the built-in GITHUB_TOKEN deliberately do not
+# trigger other workflows, so a tag pushed with it would never build. Add a repo
+# secret RELEASE_TOKEN — a fine-grained PAT for ONLY this repository with
+# "Contents: Read and write" — and rotate it like any credential. The job fails
+# with instructions when the secret is absent.
+name: release-tag
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    if: startsWith(github.event.head_commit.message, 'Prepare release v')
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      HEAD_MSG: ${{ github.event.head_commit.message }}
+      HEAD_SHA: ${{ github.sha }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Push the release tag
+        run: |
+          set -euo pipefail
+          ver=$(printf '%s' "$HEAD_MSG" | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ -z "$ver" ]; then
+            echo "::error::Could not parse a version from the commit subject"; exit 1
+          fi
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::error::RELEASE_TOKEN secret is not set. Create a fine-grained PAT (this repo only, Contents: Read and write) and add it as a repo secret named RELEASE_TOKEN, then re-run this workflow."
+            exit 1
+          fi
+          GH_TOKEN="$RELEASE_TOKEN" gh api "repos/$GH_REPO/git/refs" \
+            -f ref="refs/tags/$ver" -f sha="$HEAD_SHA"
+          echo "Pushed tag $ver at $HEAD_SHA — the build pipeline takes it from here."

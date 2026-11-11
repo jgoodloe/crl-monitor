@@ -1,0 +1,143 @@
+# One-click release, stage 1 of 2 (the human decision stays human: this only
+# ever runs when you press "Run workflow" and pick a bump).
+#
+# It bumps __version__ in app/app.py, turns the CHANGELOG's "## [Unreleased]"
+# section into the release section (or writes a stub if there is none) and
+# maintains the Keep-a-Changelog link references, pushes a release-prep branch,
+# opens a PR, and arms auto-merge. When that PR lands on main, release-tag.yml
+# pushes the tag and the existing build pipeline publishes the image + the
+# GitHub Release.
+#
+# One-time setup (repo settings):
+#   - Settings → Actions → General → "Allow GitHub Actions to create and
+#     approve pull requests" ON (the PR step says so if it is off).
+#   - A RELEASE_TOKEN secret: a fine-grained PAT for THIS repo only, with
+#     Contents: Read and write AND Pull requests: Read and write. Without the
+#     Pull-requests scope the flow falls back to GITHUB_TOKEN and is no longer
+#     hands-off (see the warning the job prints). release-tag.yml needs the
+#     same secret (Contents is enough there).
+name: release-cut
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver bump for this release"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: read
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      BUMP: ${{ inputs.bump }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Bump version and section the CHANGELOG
+        id: ver
+        run: |
+          set -euo pipefail
+          cur=$(python3 -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('app/app.py').read()).group(1))")
+          new=$(python3 - "$cur" "$BUMP" <<'PY'
+          import sys
+          major, minor, patch = map(int, sys.argv[1].split("."))
+          bump = sys.argv[2]
+          if bump == "major": major, minor, patch = major + 1, 0, 0
+          elif bump == "minor": minor, patch = minor + 1, 0
+          else: patch += 1
+          print(f"{major}.{minor}.{patch}")
+          PY
+          )
+          today=$(date -u +%Y-%m-%d)
+          echo "Releasing $cur -> $new ($today)"
+          python3 - "$cur" "$new" "$today" <<'PY'
+          import re, sys
+          cur, new, today = sys.argv[1], sys.argv[2], sys.argv[3]
+          repo = "jgoodloe/crl-monitor"
+
+          # 1. Version constant (single source of truth).
+          p = "app/app.py"
+          s = open(p).read()
+          s2 = s.replace(f'__version__ = "{cur}"', f'__version__ = "{new}"')
+          if s2 == s:
+              raise SystemExit(f"__version__ = \"{cur}\" not found in {p}")
+          open(p, "w").write(s2)
+
+          # 2. CHANGELOG section (Keep a Changelog: bracketed headings + dates).
+          #    Turn the Unreleased section into the release section; if it was
+          #    empty (or absent), fill a stub so the release job always finds
+          #    non-empty notes (an empty section fails the release).
+          p = "CHANGELOG.md"
+          s = open(p).read()
+          heading = f"## [v{new}] - {today}"
+          stub = (f"- Dependency updates and maintenance since v{cur} — see the\n"
+                  f"  [commit history](https://github.com/{repo}/compare/v{cur}...v{new}).")
+          m = re.search(r"(?m)^## \[Unreleased\][ \t]*\n(.*?)(?=^## |\Z)", s, re.S)
+          if m:
+              body = m.group(1).strip()
+              section = f"{heading}\n\n{body if body else stub}\n\n"
+              s = s[:m.start()] + section + s[m.end():]
+          else:
+              section = f"{heading}\n\n{stub}\n\n"
+              if re.search(r"(?m)^## \[v", s):
+                  s = re.sub(r"(?m)^## \[v", section + "## [v", s, count=1)
+              else:
+                  s = s.rstrip() + "\n\n" + section
+
+          # 3. Link-reference definitions: repoint [Unreleased] at the new
+          #    version and add the new version's compare link (only if the repo
+          #    maintains such a block).
+          if re.search(r"(?m)^\[Unreleased\]:", s):
+              repl = (f"[Unreleased]: https://github.com/{repo}/compare/v{new}...HEAD\n"
+                      f"[v{new}]: https://github.com/{repo}/compare/v{cur}...v{new}")
+              s = re.sub(r"(?m)^\[Unreleased\]:.*$", repl, s, count=1)
+          open(p, "w").write(s)
+          PY
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Push release-prep branch and open auto-merging PR
+        env:
+          NEW: ${{ steps.ver.outputs.version }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        # Prefer RELEASE_TOKEN (the release PAT) for the push, the PR and
+        # auto-merge: events created with the workflow's own GITHUB_TOKEN do not
+        # trigger other workflows, so a bot-created prep PR gets no CI (GitHub
+        # also holds its runs for a manual "Approve and run") and its auto-merge
+        # would not fire release-tag. For the fully hands-off path the PAT needs
+        # Contents AND Pull requests: Read and write; with less, this falls back
+        # to GITHUB_TOKEN and warns.
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "release-prep/v$NEW"
+          git add app/app.py CHANGELOG.md
+          git commit -m "Prepare release v$NEW"
+          tok="${RELEASE_TOKEN:-$GH_TOKEN}"
+          auth=$(printf 'x-access-token:%s' "$tok" | base64 -w0)
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" \
+            push origin "HEAD:refs/heads/release-prep/v$NEW"
+          body="Automated release prep (version bump + CHANGELOG section). When this merges, release-tag.yml pushes the v$NEW tag and the build pipeline publishes the image and the GitHub Release."
+          if [ -n "$RELEASE_TOKEN" ] && GH_TOKEN="$RELEASE_TOKEN" gh pr create --base main \
+               --head "release-prep/v$NEW" --title "Prepare release v$NEW" --body "$body"; then
+            GH_TOKEN="$RELEASE_TOKEN" gh pr merge --auto --squash "release-prep/v$NEW"
+          elif gh pr create --base main --head "release-prep/v$NEW" \
+               --title "Prepare release v$NEW" --body "$body"; then
+            gh pr merge --auto --squash "release-prep/v$NEW" || true
+            echo "::warning::The prep PR was created with the workflow token: a maintainer must press 'Approve and run' on its CI, and the merge may not trigger release-tag. Add 'Pull requests: Read and write' to the RELEASE_TOKEN PAT for a fully hands-off release."
+          else
+            echo "::error::Could not open the PR — give the RELEASE_TOKEN PAT 'Pull requests: Read and write', or enable 'Allow GitHub Actions to create and approve pull requests' under Settings → Actions → General, then re-run."
+            exit 1
+          fi

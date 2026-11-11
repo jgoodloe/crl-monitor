@@ -41,6 +41,12 @@ from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa, ed25519, ed448
 
+# Project version (single source of truth). The release-cut workflow bumps this
+# and the release job checks it against the git tag, so a stale version string
+# can never ship. Keep it a plain double-quoted string literal on its own line
+# below (the release tooling reads it with a regex, taking the first match).
+__version__ = "1.1.2"
+
 # --------------------------------------------------------------------------- #
 # Configuration (all via environment variables)
 # --------------------------------------------------------------------------- #

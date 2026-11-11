@@ -15,7 +15,10 @@
 #     Dependabot security/auto-merge PRs land on main, so a patched dependency
 #     flows straight through this gated rebuild and the vulnerable image is
 #     replaced automatically.
-#   * push of a vX.Y.Z tag -> publish that version plus :latest (a release).
+#   * push of a vX.Y.Z tag -> publish that version plus :latest, AND publish a
+#     GitHub Release whose notes come from that version's CHANGELOG section
+#     (after a guard confirms app/app.py __version__ matches the tag). The tag
+#     is created by release-tag.yml, which is driven by release-cut.yml.
 name: Build and publish Docker image
 
 on:
@@ -48,6 +51,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Release-time guard: a version tag must match app/app.py's __version__,
+      # so a stale version string can never ship. Fails fast before the build.
+      # (release-cut.yml keeps the two in lockstep; this catches a hand-pushed
+      # tag that skipped it.)
+      - name: Verify version constant matches tag (release tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          pkg=$(python3 -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('app/app.py').read()).group(1))")
+          if [ "v$pkg" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::app/app.py __version__=$pkg but tag is $GITHUB_REF_NAME — bump the constant and re-tag"
+            exit 1
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -104,3 +120,49 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
+
+  # Publish a GitHub Release on version tags, after the image has been built,
+  # scanned, and pushed — so a Release only ever appears for an image that
+  # cleared the CVE gate. The body is the tag's CHANGELOG section plus the GHCR
+  # pull line. release-tag.yml creates the tag that triggers this whole run.
+  release:
+    name: Publish GitHub Release
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          # Everything between "## [<tag>]" and the next "## " heading. The
+          # closing bracket in the match prevents v1.1.3 from matching v1.1.30.
+          awk -v ver="$GITHUB_REF_NAME" '
+            !found && index($0, "## [" ver "]") == 1 { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q "[^[:space:]]" release-notes.md; then
+            echo "::error::No CHANGELOG.md section found for $GITHUB_REF_NAME (expected a '## [$GITHUB_REF_NAME] - ...' heading)" >&2
+            exit 1
+          fi
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "Container image for this release:"
+            echo ""
+            echo '```'
+            echo "docker pull ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}"
+            echo '```'
+          } >> release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        with:
+          body_path: release-notes.md
