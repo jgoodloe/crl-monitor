@@ -33,7 +33,13 @@ jobs:
           steps.meta.outputs.update-type == 'version-update:semver-patch' ||
           steps.meta.outputs.update-type == 'version-update:semver-minor'
         run: |
-          gh pr review --approve "$PR_URL"
+          # Approval is best-effort: branch protection on main requires no
+          # approving review (only the pytest + cve-scan checks), so a review
+          # isn't needed to merge. It also fails outright unless "Allow GitHub
+          # Actions to create and approve pull requests" is enabled. Either way,
+          # don't let it block enabling auto-merge — that's the step that matters.
+          gh pr review --approve "$PR_URL" \
+            || echo "::notice::Self-approval skipped (not required by branch protection); enabling auto-merge anyway."
           gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
