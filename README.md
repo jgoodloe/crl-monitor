@@ -143,9 +143,11 @@ viewable per monitor via the **CRL Data** button or the
 
 ## Security
 
-This app has **no built-in authentication** — run it behind a reverse proxy
-that handles auth, and on a trusted network. The hardening below reduces the
-blast radius but does not replace access control.
+This app has **built-in authentication** (OIDC SSO + a local admin fallback) —
+see [Authentication](#authentication). It is **off by default**, and when off the
+app **refuses to start** unless you explicitly opt into open mode, so it is never
+unauthenticated on a network by accident. The hardening below applies regardless
+of how access control is handled.
 
 - **SSRF egress controls.** The CRL URL, the URLs from a certificate's
   `CRLDistributionPoints` extension, and the Uptime Kuma push URL are all
@@ -174,6 +176,30 @@ blast radius but does not replace access control.
 - **Direct exposure.** `docker-compose.yml` binds to `127.0.0.1`. If you expose
   the container directly, set `TRUSTED_PROXY_HOPS=0` so clients can't spoof
   `X-Forwarded-*` headers.
+
+## Authentication
+
+Sign-in is supported via **OIDC single sign-on** (e.g. authentik) and a **local
+username/password** fallback. Users are identified by the stable OIDC `sub` claim
+(never email); local passwords are hashed with **argon2id**; the app issues its
+own signed, `HttpOnly` session cookie (the browser never holds the IdP's tokens).
+
+There are no roles — **any authenticated user gets full access** — with an optional
+IdP-group allowlist to narrow who may sign in.
+
+**Fail-closed:** auth is off by default, and with no auth configured the app
+**refuses to start** unless `CRL_ALLOW_OPEN_MODE=true` is set (for an isolated,
+single-user box). Turn auth on with a session secret and a break-glass admin:
+
+```ini
+CRL_SESSION_SECRET=$(openssl rand -hex 32)
+CRL_BOOTSTRAP_ADMIN_PASSWORD=change-me
+```
+
+then sign in with `admin` / that password, or wire up OIDC. **Full setup — the
+authentik application/provider, the exact redirect URI
+(`https://crlmonitor.goodloe.xyz/api/auth/oidc/callback`), every environment
+variable, and the first-admin bootstrap — is in [docs/AUTH.md](docs/AUTH.md).**
 
 ## Reverse proxy
 

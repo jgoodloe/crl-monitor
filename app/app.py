@@ -22,6 +22,7 @@ import json
 import socket
 import ipaddress
 import sqlite3
+import secrets
 import threading
 import time
 import logging
@@ -31,7 +32,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 from flask import (
-    Flask, request, jsonify, g, render_template
+    Flask, request, jsonify, g, render_template, session, redirect, url_for
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
@@ -40,6 +41,9 @@ from werkzeug.wrappers import Response
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa, ed25519, ed448
+
+from authlib.integrations.flask_client import OAuth
+from passlib.context import CryptContext
 
 # Project version (single source of truth). The release-cut workflow bumps this
 # and the release job checks it against the git tag, so a stale version string
@@ -96,6 +100,54 @@ MAX_CRL_BYTES = int(os.environ.get("MAX_CRL_BYTES", str(16 * 1024 * 1024)))
 # Token-bucket rate limits per client IP (requests per minute; 0 = unlimited).
 RATE_LIMIT_MUTATE = int(os.environ.get("RATE_LIMIT_MUTATE", "60"))
 RATE_LIMIT_CHECK = int(os.environ.get("RATE_LIMIT_CHECK", "20"))
+
+# --- Authentication --------------------------------------------------------- #
+# Auth is OFF by default (single-user/dev). It turns ON when OIDC is configured
+# or a break-glass local admin password is set. When OFF, the app refuses to
+# start unless CRL_ALLOW_OPEN_MODE is explicitly set (fail-closed; see bottom).
+# Secrets come only from the environment and are never logged.
+SESSION_SECRET = os.environ.get("CRL_SESSION_SECRET", "").strip()
+SESSION_TTL_SECONDS = int(os.environ.get("CRL_SESSION_TTL_SECONDS", str(8 * 3600)))
+SESSION_COOKIE_NAME = (os.environ.get("CRL_SESSION_COOKIE_NAME", "crlmonitor_session").strip()
+                       or "crlmonitor_session")
+# Secure flag on the session cookie (HTTPS). Default true; set false only for
+# plain-HTTP local testing.
+SESSION_COOKIE_SECURE = _env_bool("CRL_SESSION_COOKIE_SECURE", True)
+# Local username/password login (the break-glass admin below).
+LOCAL_LOGIN_ENABLED = _env_bool("CRL_LOCAL_LOGIN_ENABLED", True)
+# Break-glass local admin, created/refreshed at startup from the env. This is
+# also the local fallback that keeps the app usable when the IdP is down.
+BOOTSTRAP_ADMIN_USERNAME = (os.environ.get("CRL_BOOTSTRAP_ADMIN_USERNAME", "admin").strip()
+                            or "admin")
+BOOTSTRAP_ADMIN_PASSWORD = os.environ.get("CRL_BOOTSTRAP_ADMIN_PASSWORD", "")
+# Explicit opt-in to run with NO authentication (anyone who can reach the port
+# has full access). Only safe on an isolated/single-user box.
+ALLOW_OPEN_MODE = _env_bool("CRL_ALLOW_OPEN_MODE", False)
+# OIDC (authentik or any standard issuer). All three of issuer/client_id/
+# client_secret must be set to enable the SSO button.
+OIDC_ISSUER = os.environ.get("CRL_OIDC_ISSUER", "").strip()
+OIDC_CLIENT_ID = os.environ.get("CRL_OIDC_CLIENT_ID", "").strip()
+OIDC_CLIENT_SECRET = os.environ.get("CRL_OIDC_CLIENT_SECRET", "")
+OIDC_SCOPES = (os.environ.get("CRL_OIDC_SCOPES", "openid email profile").strip()
+               or "openid email profile")
+# Claim carrying group names, for the optional login allowlist below.
+OIDC_GROUP_CLAIM = os.environ.get("CRL_OIDC_GROUP_CLAIM", "groups").strip() or "groups"
+# Optional: restrict OIDC logins to members of at least one of these groups.
+# Empty => any authenticated IdP user may log in (this app has no roles).
+OIDC_ALLOWED_GROUPS = [
+    g.strip() for g in os.environ.get("CRL_OIDC_ALLOWED_GROUPS", "").split(",") if g.strip()
+]
+# Absolute public URL (e.g. https://crlmonitor.goodloe.xyz) used to build the
+# OIDC redirect URI. When empty it is derived from the (proxy-forwarded) request.
+PUBLIC_BASE_URL = os.environ.get("CRL_PUBLIC_BASE_URL", "").strip()
+
+OIDC_ENABLED = bool(OIDC_ISSUER and OIDC_CLIENT_ID and OIDC_CLIENT_SECRET)
+
+
+def auth_active():
+    """True when authentication is enforced: OIDC configured, or a break-glass
+    local admin password is set. Otherwise the app runs open (single-user/dev)."""
+    return bool(OIDC_ENABLED or BOOTSTRAP_ADMIN_PASSWORD)
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -309,6 +361,22 @@ CREATE INDEX IF NOT EXISTS idx_snap_monitor
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- Authentication: local (username/password) and OIDC (matched on the stable
+-- `sub` claim, never email) users. Uniquely identified by (provider, subject).
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider      TEXT NOT NULL,           -- 'local' | 'oidc'
+    subject       TEXT NOT NULL,           -- local username, or the OIDC `sub`
+    email         TEXT,
+    display_name  TEXT,
+    password_hash TEXT,                    -- argon2id (local accounts only)
+    is_admin      INTEGER NOT NULL DEFAULT 0,
+    is_active     INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    last_login_at TEXT,
+    UNIQUE(provider, subject)
 );
 """
 
@@ -1856,6 +1924,288 @@ def _guard_requests():
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Authentication (local argon2 + OIDC SSO)
+# --------------------------------------------------------------------------- #
+# The session cookie is signed by Flask (itsdangerous). A stable CRL_SESSION_SECRET
+# must be set in production; without one an ephemeral key is used and sessions do
+# not survive a restart. The browser only ever holds this app's signed session —
+# never the IdP's tokens.
+app.secret_key = SESSION_SECRET or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_NAME=SESSION_COOKIE_NAME,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=SESSION_TTL_SECONDS,
+)
+if auth_active() and not SESSION_SECRET:
+    log.warning("[Auth] CRL_SESSION_SECRET is not set; using an ephemeral key "
+                "(sessions won't survive a restart). Set it in production.")
+
+_pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+
+# OIDC client (authlib). Registered only when OIDC is configured; the provider
+# metadata is discovered lazily from the issuer at login time. authlib stores the
+# CSRF `state` and the `nonce` in the session and validates both on callback.
+_oauth = OAuth(app)
+if OIDC_ENABLED:
+    _oauth.register(
+        name="oidc",
+        client_id=OIDC_CLIENT_ID,
+        client_secret=OIDC_CLIENT_SECRET,
+        server_metadata_url=OIDC_ISSUER.rstrip("/") + "/.well-known/openid-configuration",
+        client_kwargs={"scope": OIDC_SCOPES},
+    )
+
+
+def _oidc_client():
+    return _oauth.create_client("oidc")
+
+
+def hash_password(password):
+    return _pwd_context.hash(password)
+
+
+def verify_password(password, password_hash):
+    if not password_hash:
+        return False
+    try:
+        return _pwd_context.verify(password, password_hash)
+    except Exception:
+        return False
+
+
+def ensure_bootstrap_admin():
+    """Create (or refresh the password of) the break-glass local admin from the
+    env. Never logs the password. No-op when CRL_BOOTSTRAP_ADMIN_PASSWORD is unset."""
+    if not BOOTSTRAP_ADMIN_PASSWORD:
+        return
+    with closing(raw_db()) as db:
+        row = db.execute(
+            "SELECT id FROM users WHERE provider='local' AND subject=?",
+            (BOOTSTRAP_ADMIN_USERNAME,),
+        ).fetchone()
+        ph = hash_password(BOOTSTRAP_ADMIN_PASSWORD)
+        if row is None:
+            db.execute(
+                "INSERT INTO users (provider, subject, display_name, password_hash, "
+                "is_admin, is_active, created_at) VALUES ('local', ?, ?, ?, 1, 1, ?)",
+                (BOOTSTRAP_ADMIN_USERNAME, BOOTSTRAP_ADMIN_USERNAME, ph, now_iso()),
+            )
+            log.info("[Auth] created break-glass admin %r", BOOTSTRAP_ADMIN_USERNAME)
+        else:
+            db.execute(
+                "UPDATE users SET password_hash=?, is_admin=1, is_active=1 WHERE id=?",
+                (ph, row["id"]),
+            )
+        db.commit()
+
+
+def get_or_create_oidc_user(db, subject, email, display_name):
+    """Match on the stable OIDC `sub` (never email); provision on first login and
+    refresh the mutable display fields (email/name) on subsequent logins."""
+    row = db.execute(
+        "SELECT * FROM users WHERE provider='oidc' AND subject=?", (subject,)
+    ).fetchone()
+    now = now_iso()
+    if row is None:
+        db.execute(
+            "INSERT INTO users (provider, subject, email, display_name, is_active, "
+            "created_at, last_login_at) VALUES ('oidc', ?, ?, ?, 1, ?, ?)",
+            (subject, email, display_name or email or subject, now, now),
+        )
+        log.info("[Auth] provisioned OIDC user sub=%s", subject)
+    else:
+        db.execute(
+            "UPDATE users SET email=COALESCE(?, email), "
+            "display_name=COALESCE(?, display_name), last_login_at=? WHERE id=?",
+            (email, display_name, now, row["id"]),
+        )
+    db.commit()
+    return db.execute(
+        "SELECT * FROM users WHERE provider='oidc' AND subject=?", (subject,)
+    ).fetchone()
+
+
+def _user_public(u):
+    """Non-sensitive user fields for the API (never the password hash)."""
+    return {
+        "id": u["id"], "provider": u["provider"], "subject": u["subject"],
+        "email": u["email"], "display_name": u["display_name"],
+        "is_admin": bool(u["is_admin"]),
+    }
+
+
+# Synthetic principal returned in open mode so single-user deployments keep
+# working with zero ceremony.
+_ANONYMOUS_USER = {
+    "id": 0, "provider": "local", "subject": "__anonymous__",
+    "email": None, "display_name": "Anonymous", "is_admin": 1,
+}
+
+
+def _current_user():
+    """The authenticated user (as a mapping), or None. In open mode returns the
+    synthetic anonymous admin."""
+    if not auth_active():
+        return _ANONYMOUS_USER
+    uid = session.get("uid")
+    if not uid:
+        return None
+    row = get_db().execute(
+        "SELECT * FROM users WHERE id=? AND is_active=1", (uid,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _login_user(user_id):
+    session.clear()
+    session["uid"] = user_id
+    session.permanent = True
+
+
+def _oidc_redirect_uri():
+    """The absolute callback URL registered with the IdP. Prefer the configured
+    public base URL; otherwise derive it from the (proxy-forwarded) request, which
+    requires ProxyFix to trust the reverse proxy for X-Forwarded-Proto/Host."""
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL.rstrip("/") + (URL_PREFIX or "") + "/api/auth/oidc/callback"
+    return url_for("oidc_callback", _external=True)
+
+
+# Small per-(ip, username) login throttle for the local password path.
+_LOGIN_FAILURES = {}
+_LOGIN_MAX_FAILURES = 5
+_LOGIN_WINDOW = 300.0
+
+
+def _login_rate_limited(key):
+    count, first = _LOGIN_FAILURES.get(key, (0, 0.0))
+    return count >= _LOGIN_MAX_FAILURES and (time.monotonic() - first) < _LOGIN_WINDOW
+
+
+def _login_record_failure(key):
+    count, first = _LOGIN_FAILURES.get(key, (0, 0.0))
+    if (time.monotonic() - first) >= _LOGIN_WINDOW:
+        count, first = 0, time.monotonic()
+    _LOGIN_FAILURES[key] = (count + 1, first or time.monotonic())
+
+
+# Endpoints reachable without a session: the auth endpoints themselves and the
+# health check (used by the container HEALTHCHECK). `/api/status` must stay open
+# or the container is marked unhealthy once auth is on.
+_AUTH_PUBLIC_PATHS = frozenset({
+    "/api/auth/config", "/api/auth/login", "/api/auth/logout",
+    "/api/auth/oidc/login", "/api/auth/oidc/callback", "/api/status",
+})
+
+
+@app.before_request
+def _require_login():
+    """Enforce authentication once it is configured. API calls get a 401; the
+    SPA shell ('/') is allowed through so its login gate can render."""
+    if not auth_active():
+        return None
+    path = request.path
+    if path in _AUTH_PUBLIC_PATHS:
+        return None
+    if _current_user() is not None:
+        return None
+    if path.startswith("/api/"):
+        return jsonify({"message": "Authentication required"}), 401
+    return None
+
+
+@app.route("/api/auth/config", methods=["GET"])
+def auth_config():
+    prefix = URL_PREFIX or ""
+    return jsonify({
+        "auth_required": auth_active(),
+        "local_login_enabled": LOCAL_LOGIN_ENABLED,
+        "oidc_enabled": OIDC_ENABLED,
+        "oidc_login_url": (prefix + "/api/auth/oidc/login") if OIDC_ENABLED else None,
+    })
+
+
+@app.route("/api/auth/me", methods=["GET"])
+def auth_me():
+    u = _current_user()
+    if u is None:
+        return jsonify({"message": "Authentication required"}), 401
+    return jsonify(_user_public(u))
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    """Local username/password login (argon2), used by the break-glass admin."""
+    if not LOCAL_LOGIN_ENABLED:
+        return jsonify({"message": "Local login is disabled."}), 403
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    key = (request.remote_addr or "unknown", username)
+    if _login_rate_limited(key):
+        return jsonify({"message": "Too many login attempts; try again later."}), 429
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM users WHERE provider='local' AND subject=?", (username,)
+    ).fetchone()
+    if row is None or not row["is_active"] or not verify_password(password, row["password_hash"]):
+        _login_record_failure(key)
+        log.info("[Auth] local login failed for %r", username)
+        return jsonify({"message": "Invalid username or password."}), 401
+    _LOGIN_FAILURES.pop(key, None)
+    db.execute("UPDATE users SET last_login_at=? WHERE id=?", (now_iso(), row["id"]))
+    db.commit()
+    _login_user(row["id"])
+    return jsonify(_user_public(row))
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    session.clear()
+    return ("", 204)
+
+
+@app.route("/api/auth/oidc/login", methods=["GET"])
+def oidc_login():
+    if not OIDC_ENABLED:
+        return jsonify({"message": "OIDC is not configured."}), 404
+    # authlib generates + stores state and nonce in the session, then redirects
+    # to the IdP's authorization endpoint.
+    return _oidc_client().authorize_redirect(_oidc_redirect_uri())
+
+
+@app.route("/api/auth/oidc/callback", methods=["GET"], endpoint="oidc_callback")
+def oidc_callback():
+    if not OIDC_ENABLED:
+        return jsonify({"message": "OIDC is not configured."}), 404
+    try:
+        # Exchanges the code and validates state + nonce; raises on any mismatch.
+        token = _oidc_client().authorize_access_token()
+    except Exception as exc:  # network / validation failures
+        log.warning("[Auth] OIDC token exchange failed: %s", exc)
+        return redirect((URL_PREFIX or "") + "/?auth_error=1")
+    claims = (token or {}).get("userinfo") or {}
+    sub = claims.get("sub")
+    if not sub:
+        log.warning("[Auth] OIDC response missing 'sub' claim")
+        return redirect((URL_PREFIX or "") + "/?auth_error=1")
+    groups = claims.get(OIDC_GROUP_CLAIM) or []
+    if isinstance(groups, str):
+        groups = [groups]
+    groups = [str(x) for x in groups]
+    if OIDC_ALLOWED_GROUPS and not (set(groups) & set(OIDC_ALLOWED_GROUPS)):
+        log.info("[Auth] OIDC login denied for sub=%s (no allowed group)", sub)
+        return redirect((URL_PREFIX or "") + "/?auth_error=1")
+    user = get_or_create_oidc_user(
+        get_db(), str(sub), claims.get("email"), claims.get("name")
+    )
+    _login_user(user["id"])
+    return redirect((URL_PREFIX or "") + "/")
+
+
 @app.teardown_appcontext
 def close_db(exc):
     db = getattr(g, "_db", None)
@@ -2446,8 +2796,22 @@ def put_settings():
     return get_settings()
 
 
-# Initialise DB + scheduler at import time (works under gunicorn too).
+# Initialise DB, provision the break-glass admin, enforce the fail-closed auth
+# policy, then start the scheduler — all at import time (works under gunicorn too).
 init_db()
+ensure_bootstrap_admin()
+# Fail closed: with no auth configured every request has full access, so refuse
+# to start unless the operator has explicitly opted into open mode (isolated /
+# single-user use only).
+if not auth_active() and not ALLOW_OPEN_MODE:
+    raise RuntimeError(
+        "Refusing to start: no authentication is configured, which would let "
+        "anyone who can reach the port use the app with full access. Configure "
+        "OIDC (CRL_OIDC_ISSUER / CRL_OIDC_CLIENT_ID / CRL_OIDC_CLIENT_SECRET) or a "
+        "break-glass local admin (CRL_BOOTSTRAP_ADMIN_PASSWORD). To intentionally "
+        "run with NO authentication on an isolated/single-user box, set "
+        "CRL_ALLOW_OPEN_MODE=true."
+    )
 start_scheduler()
 
 # Apply URL prefix for subpath deployments.

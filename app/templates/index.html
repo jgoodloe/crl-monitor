@@ -64,7 +64,7 @@
   }
   .modal h2 { margin: 0 0 16px; font-size: 16px; }
   label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; font-weight: 600; }
-  input[type=text], input[type=number], input[type=url], textarea {
+  input[type=text], input[type=number], input[type=url], input[type=password], textarea {
     width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
     color: var(--text); padding: 9px 10px; font-size: 13px; font-family: inherit;
   }
@@ -135,11 +135,38 @@
   <h1><span class="dot"></span> CRL Monitor</h1>
   <div class="toolbar">
     <span class="msg muted" id="globalMsg"></span>
+    <span class="muted small" id="whoami"></span>
     <button class="secondary" onclick="openReports()">Reports</button>
     <button class="secondary" onclick="openSettings()">Settings</button>
     <button onclick="openForm()">+ Add monitor</button>
+    <button class="secondary" id="logoutBtn" style="display:none" onclick="doLogout()">Logout</button>
   </div>
 </header>
+
+<!-- Auth gate: shown over the app when authentication is required and the
+     visitor is not signed in. -->
+<div class="overlay" id="authGate">
+  <div class="modal" style="max-width:380px">
+    <h2><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent)"></span> Sign in</h2>
+    <div class="errors" id="authError"></div>
+    <div id="localLoginBox">
+      <label>Username</label>
+      <input type="text" id="au_user" autocomplete="username">
+      <label>Password</label>
+      <input type="password" id="au_pass" autocomplete="current-password"
+             onkeydown="if(event.key==='Enter')doLogin()">
+      <div class="modal-actions" style="margin-top:16px">
+        <button onclick="doLogin()" style="flex:1">Sign in</button>
+      </div>
+    </div>
+    <div id="ssoBox" style="display:none; margin-top:14px">
+      <div class="muted small" style="text-align:center; margin:6px 0">or</div>
+      <a id="ssoLink" href="#" style="text-decoration:none">
+        <button class="secondary" style="width:100%">Sign in with SSO</button>
+      </a>
+    </div>
+  </div>
+</div>
 
 <main>
   <table id="table">
@@ -955,10 +982,78 @@ async function delMaint(id) {
 }
 
 // Close modals on overlay click.
+// Close modals on backdrop click — but never the auth gate (that would reveal
+// the app without signing in).
 document.querySelectorAll('.overlay').forEach(o =>
-  o.addEventListener('click', e => { if (e.target === o) o.classList.remove('open'); }));
+  o.addEventListener('click', e => {
+    if (e.target === o && o.id !== 'authGate') o.classList.remove('open');
+  }));
+
+// ---- Authentication ----
+let AUTH = { required: false, oidc: false, user: null };
+
+async function checkAuth() {
+  try {
+    const cfg = await (await fetch(API('/auth/config'))).json();
+    AUTH.required = !!cfg.auth_required;
+    AUTH.oidc = !!cfg.oidc_enabled;
+    document.getElementById('ssoBox').style.display = cfg.oidc_enabled ? 'block' : 'none';
+    document.getElementById('localLoginBox').style.display = cfg.local_login_enabled ? 'block' : 'none';
+    if (cfg.oidc_login_url) document.getElementById('ssoLink').href = cfg.oidc_login_url;
+  } catch (e) { AUTH.required = true; }   // fail closed: show the gate
+
+  if (!AUTH.required) { showApp(null); return true; }
+
+  const res = await fetch(API('/auth/me'));
+  if (res.ok) { AUTH.user = await res.json(); showApp(AUTH.user); return true; }
+  showGate();
+  return false;
+}
+
+function showGate() {
+  if (new URLSearchParams(location.search).get('auth_error'))
+    document.getElementById('authError').textContent = 'Sign-in failed. Please try again.';
+  document.getElementById('authGate').classList.add('open');
+  document.getElementById('logoutBtn').style.display = 'none';
+  document.getElementById('whoami').textContent = '';
+}
+
+function showApp(user) {
+  document.getElementById('authGate').classList.remove('open');
+  const who = document.getElementById('whoami');
+  const lo = document.getElementById('logoutBtn');
+  if (user && AUTH.required) {
+    who.textContent = user.display_name || user.subject;
+    lo.style.display = '';
+  } else { who.textContent = ''; lo.style.display = 'none'; }
+}
+
+async function doLogin() {
+  const username = document.getElementById('au_user').value;
+  const password = document.getElementById('au_pass').value;
+  const err = document.getElementById('authError'); err.textContent = '';
+  try {
+    const res = await mutate(API('/auth/login'), 'POST', { username, password });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      err.textContent = (j && j.message) || 'Sign-in failed.';
+      return;
+    }
+    document.getElementById('au_pass').value = '';
+    history.replaceState(null, '', location.pathname);   // drop ?auth_error
+    if (await checkAuth()) init();
+  } catch (e) { err.textContent = e.message; }
+}
+
+async function doLogout() {
+  try { await mutate(API('/auth/logout'), 'POST'); } catch (e) {}
+  AUTH.user = null;
+  document.getElementById('rows').innerHTML = '';
+  showGate();
+}
 
 async function init() {
+  if (!(await checkAuth())) return;   // gated: don't fetch app data (would 401)
   await loadTests();
   // Preload global settings so the Add form and dashboard reflect them before
   // the Settings modal is ever opened.
@@ -970,7 +1065,10 @@ async function init() {
   load();
 }
 init();
-setInterval(load, 15000);  // poll for live status
+// Poll for live status, but not while the sign-in gate is up.
+setInterval(() => {
+  if (!document.getElementById('authGate').classList.contains('open')) load();
+}, 15000);
 </script>
 </body>
 </html>

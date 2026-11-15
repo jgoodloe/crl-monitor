@@ -6,11 +6,11 @@ services:
     container_name: crl-monitor
     restart: unless-stopped
     ports:
-      # Bind to loopback only: the app has no authentication, so expose it
-      # through your reverse proxy rather than directly. Point the proxy
-      # upstream at 127.0.0.1:8080. To serve it directly (no proxy), change
-      # this to "8080:8080" AND set TRUSTED_PROXY_HOPS=0 so forwarded headers
-      # can't be spoofed.
+      # Bind to loopback only and expose through your reverse proxy (which also
+      # terminates TLS). Point the proxy upstream at 127.0.0.1:8080. To serve it
+      # directly (no proxy), change this to "8080:8080" AND set
+      # TRUSTED_PROXY_HOPS=0 so forwarded headers can't be spoofed. Configure
+      # authentication below before exposing it beyond localhost (see docs/AUTH.md).
       - "127.0.0.1:8080:8080"
     environment:
       PORT: "8080"
@@ -38,6 +38,24 @@ services:
       MAX_MONITORS: "${MAX_MONITORS:-100}"
       RATE_LIMIT_MUTATE: "${RATE_LIMIT_MUTATE:-60}"
       RATE_LIMIT_CHECK: "${RATE_LIMIT_CHECK:-20}"
+      # --- Authentication (see docs/AUTH.md) --- #
+      # Auth is OFF unless you set a bootstrap admin password or configure OIDC.
+      # With auth OFF the app refuses to start unless CRL_ALLOW_OPEN_MODE=true.
+      CRL_ALLOW_OPEN_MODE: "${CRL_ALLOW_OPEN_MODE:-false}"
+      CRL_SESSION_SECRET: "${CRL_SESSION_SECRET:-}"
+      CRL_SESSION_COOKIE_SECURE: "${CRL_SESSION_COOKIE_SECURE:-true}"
+      CRL_SESSION_TTL_SECONDS: "${CRL_SESSION_TTL_SECONDS:-28800}"
+      CRL_LOCAL_LOGIN_ENABLED: "${CRL_LOCAL_LOGIN_ENABLED:-true}"
+      CRL_BOOTSTRAP_ADMIN_USERNAME: "${CRL_BOOTSTRAP_ADMIN_USERNAME:-admin}"
+      CRL_BOOTSTRAP_ADMIN_PASSWORD: "${CRL_BOOTSTRAP_ADMIN_PASSWORD:-}"
+      # OIDC SSO (all three required to enable the SSO button).
+      CRL_OIDC_ISSUER: "${CRL_OIDC_ISSUER:-}"
+      CRL_OIDC_CLIENT_ID: "${CRL_OIDC_CLIENT_ID:-}"
+      CRL_OIDC_CLIENT_SECRET: "${CRL_OIDC_CLIENT_SECRET:-}"
+      CRL_OIDC_SCOPES: "${CRL_OIDC_SCOPES:-openid email profile}"
+      CRL_OIDC_GROUP_CLAIM: "${CRL_OIDC_GROUP_CLAIM:-groups}"
+      CRL_OIDC_ALLOWED_GROUPS: "${CRL_OIDC_ALLOWED_GROUPS:-}"
+      CRL_PUBLIC_BASE_URL: "${CRL_PUBLIC_BASE_URL:-}"
     volumes:
       # Persistent SQLite database (survives container rebuilds).
       - crl_data:/data

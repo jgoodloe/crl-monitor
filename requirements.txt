@@ -2,3 +2,14 @@ Flask==3.1.3
 gunicorn==26.2.0
 requests==2.34.2
 cryptography==50.0.2
+
+# --- Authentication (OIDC SSO + local argon2 login) --------------------------
+# Authlib is the OpenID Connect client. The floor is 1.3.1, which is the release
+# that fixes CVE-2024-37568 (ID-token algorithm-confusion forgery); this pin is
+# far above that floor.
+Authlib==1.9.6
+# Local username/password fallback, hashed with argon2id.
+passlib[argon2]==1.7.4
+# Signs the session cookie (also a Flask dependency; pinned to the current
+# release explicitly).
+itsdangerous==2.2.0
