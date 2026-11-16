@@ -1,5 +1,5 @@
 # CRL Monitor — single container (API + UI + scheduler in one process group)
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 # OpenSSL libs are present in the base image; the app uses the `cryptography`
 # Python library for CRL parsing/verification, so no openssl CLI is required.
